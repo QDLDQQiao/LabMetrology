@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 os.environ.setdefault("MPLCONFIGDIR", str(Path.cwd() / ".matplotlib-cache"))
+os.environ.setdefault("MPLBACKEND", "Agg")
 
 import numpy as np
 import torch
@@ -186,6 +188,7 @@ class StitchingModel(nn.Module):
         min_output_coverage: float = 0.15,
         step_px: float | None = None,
         initial_optic: np.ndarray | None = None,
+        anchor_curvature: bool = True,
         device: str = "cpu",
     ):
         super().__init__()
@@ -234,23 +237,310 @@ class StitchingModel(nn.Module):
 
         warm, soft_coverage = warm_start_optic(clean_M, clean_mask, scan_positions, optic_canvas_shape)
         _, binary_coverage = warm_start_optic(clean_M, binary_mask, scan_positions, optic_canvas_shape)
+        optic_prior = None
+        optic_prior_mask = None
         if initial_optic is not None:
             if initial_optic.shape != warm.shape:
                 raise ValueError(f"initial_optic shape {initial_optic.shape} does not match canvas {warm.shape}")
             init = np.asarray(initial_optic, dtype=np.float64).copy()
+            prior_valid = np.isfinite(init) & (binary_coverage > 0)
             init[~np.isfinite(init)] = warm[~np.isfinite(init)]
             warm = init
+            optic_prior = np.where(prior_valid, init, 0.0)
+            optic_prior_mask = prior_valid.astype(np.float64)
         self.O = nn.Parameter(torch.as_tensor(warm, dtype=torch.float64, device=device_t))
+        if optic_prior is not None and optic_prior_mask is not None:
+            self.register_buffer("optic_prior", torch.as_tensor(optic_prior, dtype=torch.float64, device=device_t))
+            self.register_buffer("optic_prior_mask", torch.as_tensor(optic_prior_mask, dtype=torch.float64, device=device_t))
+        else:
+            self.optic_prior = None
+            self.optic_prior_mask = None
         binary_coverage_norm = binary_coverage / max(float(np.max(binary_coverage)), 1.0)
         soft_coverage_norm = soft_coverage / max(float(np.max(soft_coverage)), 1.0)
         self.min_output_coverage = min_output_coverage
         self.register_buffer("optic_observed_mask", torch.as_tensor(binary_coverage_norm, dtype=torch.float64, device=device_t))
         self.register_buffer("optic_quality_mask", torch.as_tensor(soft_coverage_norm, dtype=torch.float64, device=device_t))
+        coverage_t = torch.as_tensor(binary_coverage_norm, dtype=torch.float64, device=device_t)
+        obs_t = (coverage_t > 0).to(torch.float64)
+        grad_valid_x = obs_t[:, 1:] * obs_t[:, :-1]
+        grad_valid_y = obs_t[1:, :] * obs_t[:-1, :]
+        seam_weight_x = grad_valid_x * torch.abs(coverage_t[:, 1:] - coverage_t[:, :-1])
+        seam_weight_y = grad_valid_y * torch.abs(coverage_t[1:, :] - coverage_t[:-1, :])
+        seam_count_x = (seam_weight_x > 0).to(torch.float64).sum()
+        seam_count_y = (seam_weight_y > 0).to(torch.float64).sum()
+        seam_mean_x = seam_weight_x.sum() / seam_count_x.clamp_min(1.0)
+        seam_mean_y = seam_weight_y.sum() / seam_count_y.clamp_min(1.0)
+        seam_weight_x = torch.where(seam_count_x > 0, seam_weight_x / seam_mean_x.clamp_min(1e-12), seam_weight_x)
+        seam_weight_y = torch.where(seam_count_y > 0, seam_weight_y / seam_mean_y.clamp_min(1e-12), seam_weight_y)
+        lap_valid_x = obs_t[:, 2:] * obs_t[:, 1:-1] * obs_t[:, :-2]
+        lap_valid_y = obs_t[2:, :] * obs_t[1:-1, :] * obs_t[:-2, :]
+        seam_lap_weight_x = lap_valid_x * torch.maximum(
+            torch.abs(coverage_t[:, 2:] - coverage_t[:, 1:-1]),
+            torch.abs(coverage_t[:, 1:-1] - coverage_t[:, :-2]),
+        )
+        seam_lap_weight_y = lap_valid_y * torch.maximum(
+            torch.abs(coverage_t[2:, :] - coverage_t[1:-1, :]),
+            torch.abs(coverage_t[1:-1, :] - coverage_t[:-2, :]),
+        )
+        seam_lap_count_x = (seam_lap_weight_x > 0).to(torch.float64).sum()
+        seam_lap_count_y = (seam_lap_weight_y > 0).to(torch.float64).sum()
+        seam_lap_mean_x = seam_lap_weight_x.sum() / seam_lap_count_x.clamp_min(1.0)
+        seam_lap_mean_y = seam_lap_weight_y.sum() / seam_lap_count_y.clamp_min(1.0)
+        seam_lap_weight_x = torch.where(seam_lap_count_x > 0, seam_lap_weight_x / seam_lap_mean_x.clamp_min(1e-12), seam_lap_weight_x)
+        seam_lap_weight_y = torch.where(seam_lap_count_y > 0, seam_lap_weight_y / seam_lap_mean_y.clamp_min(1e-12), seam_lap_weight_y)
+        self.register_buffer("optic_grad_valid_x", grad_valid_x)
+        self.register_buffer("optic_grad_valid_y", grad_valid_y)
+        self.register_buffer("optic_seam_weight_x", seam_weight_x)
+        self.register_buffer("optic_seam_weight_y", seam_weight_y)
+        self.register_buffer("optic_lap_valid_x", lap_valid_x)
+        self.register_buffer("optic_lap_valid_y", lap_valid_y)
+        self.register_buffer("optic_seam_lap_weight_x", seam_lap_weight_x)
+        self.register_buffer("optic_seam_lap_weight_y", seam_lap_weight_y)
         self.S = nn.Parameter(torch.zeros((self.h, self.w), dtype=torch.float64, device=device_t)) if fit_S else None
         k = 1 + (2 if self.fit_tilt_per_frame else 0) + (1 if fit_power_per_frame else 0)
         self.power_col = k - 1 if fit_power_per_frame else None
         self.planes = nn.Parameter(torch.zeros((self.N, k), dtype=torch.float64, device=device_t))
         self.delta_pos = nn.Parameter(torch.zeros((self.N, 2), dtype=torch.float64, device=device_t)) if fit_positions else None
+        if fit_positions:
+            scan_x = scan_positions[:, 1].astype(np.float64)
+            if np.ptp(scan_x) > 0:
+                scan_x_norm = 2.0 * (scan_x - scan_x.min()) / np.ptp(scan_x) - 1.0
+            else:
+                scan_x_norm = np.zeros_like(scan_x)
+            position_design = np.column_stack([np.ones(self.N, dtype=np.float64), scan_x_norm])
+            self.register_buffer("position_gauge_design", torch.as_tensor(position_design, dtype=torch.float64, device=device_t))
+        else:
+            self.position_gauge_design = None
+        self.curvature_anchor_enabled = bool(anchor_curvature and initial_optic is not None)
+        self._setup_curvature_anchor()
+        if initial_optic is not None:
+            self.initialize_planes_from_current_optic()
+
+    @property
+    def S_effective(self) -> torch.Tensor | None:
+        if not self.fit_S or self.S is None:
+            return None
+        proj = (self.S[None] * self.S_low_bases).sum(dim=(1, 2))
+        return self.S - (proj[:, None, None] * self.S_low_bases).sum(dim=0)
+
+    def _setup_curvature_anchor(self) -> None:
+        y = torch.linspace(-1.0, 1.0, self.H, dtype=torch.float64, device=self.O.device)
+        x = torch.linspace(-1.0, 1.0, self.W, dtype=torch.float64, device=self.O.device)
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+        self.register_buffer("optic_poly_x2", xx**2)
+        self.register_buffer("optic_poly_y2", yy**2)
+        valid = self.optic_observed_mask > 0
+        design = torch.stack([
+            torch.ones_like(xx)[valid],
+            xx[valid],
+            yy[valid],
+            (xx**2)[valid],
+            (yy**2)[valid],
+        ], dim=1)
+        self.register_buffer("optic_poly_valid", valid)
+        self.register_buffer("optic_poly_design", design)
+        affine_design = design[:, :3]
+        affine_gram = affine_design.T @ affine_design
+        affine_gram = affine_gram + 1e-12 * torch.eye(3, dtype=torch.float64, device=self.O.device)
+        self.register_buffer("optic_affine_design", affine_design)
+        self.register_buffer("optic_affine_gram_inv", torch.linalg.inv(affine_gram))
+        with torch.no_grad():
+            self.register_buffer("curvature_prior_coeff", self._optic_poly_coeff(self.O).detach())
+
+    def _optic_poly_coeff(self, image: torch.Tensor) -> torch.Tensor:
+        values = image[self.optic_poly_valid].reshape(-1, 1)
+        if values.numel() < 5:
+            return torch.zeros(5, dtype=torch.float64, device=image.device)
+        return torch.linalg.lstsq(self.optic_poly_design, values).solution[:, 0]
+
+    def project_curvature_to_prior(self) -> None:
+        if not self.curvature_anchor_enabled:
+            return
+        with torch.no_grad():
+            coeff = self._optic_poly_coeff(self.O)
+            dqxx = self.curvature_prior_coeff[3] - coeff[3]
+            dqyy = self.curvature_prior_coeff[4] - coeff[4]
+            self.O += dqxx * self.optic_poly_x2 + dqyy * self.optic_poly_y2
+
+    def _plane_from_coeffs(self, pl: torch.Tensor) -> torch.Tensor:
+        plane = pl[:, 0, None, None]
+        if self.fit_tilt_per_frame:
+            plane = plane + pl[:, 1, None, None] * self.tilt_u[None] + pl[:, 2, None, None] * self.tilt_v[None]
+        if self.fit_power_per_frame and self.power_col is not None:
+            plane = plane + pl[:, self.power_col, None, None] * self.power_basis[None]
+        return plane
+
+    def _sample_optic(self, frame_idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        grid, inside = self.build_grid(frame_idx)
+        optic_in = self.O[None, None].expand(len(frame_idx), -1, -1, -1)
+        optic_sub = F.grid_sample(
+            optic_in,
+            grid,
+            mode=self.interp_mode,
+            padding_mode="zeros",
+            align_corners=True,
+        ).squeeze(1)
+        return optic_sub, inside
+
+    def _current_systematic_term(self) -> torch.Tensor | float:
+        if self.fit_S:
+            s_eff = self.S_effective
+            return s_eff if s_eff is not None else 0.0
+        if self.S_fixed is not None:
+            return self.S_fixed
+        return 0.0
+
+    def initialize_planes_from_current_optic(self) -> None:
+        with torch.no_grad():
+            s_term = self._current_systematic_term()
+            for frame in range(self.N):
+                idx = torch.tensor([frame], dtype=torch.long, device=self.M.device)
+                optic_sub, inside = self._sample_optic(idx)
+                optic_sub = optic_sub.squeeze(0)
+                valid = (self.mask[frame] * inside[0]) > 0
+                if int(valid.sum().item()) < self.planes.shape[1]:
+                    continue
+                residual = self.M[frame] - optic_sub - s_term
+                cols = [torch.ones_like(self.tilt_u)[valid]]
+                if self.fit_tilt_per_frame:
+                    cols += [self.tilt_u[valid], self.tilt_v[valid]]
+                if self.fit_power_per_frame:
+                    cols.append(self.power_basis[valid])
+                design = torch.stack(cols, dim=1)
+                coeff = torch.linalg.lstsq(design, residual[valid].reshape(-1, 1)).solution[:, 0]
+                self.planes[frame, : coeff.numel()] = coeff
+
+    def project_systematic_gauge(self) -> None:
+        if not self.fit_S or self.S is None:
+            return
+        with torch.no_grad():
+            proj = (self.S[None] * self.S_low_bases).sum(dim=(1, 2))
+            self.S -= (proj[:, None, None] * self.S_low_bases).sum(dim=0)
+
+    def update_optic_from_current_terms(self) -> dict[str, float]:
+        """Closed-form optic update using the same subpixel geometry as ADP."""
+
+        if not self.fit_S or self.S is None:
+            return {}
+        previous = self.O.detach().clone()
+        numerator = torch.zeros_like(self.O)
+        denominator = torch.zeros_like(self.O)
+        with torch.no_grad():
+            pos = self.current_positions()
+            s_eff = self.S_effective
+            s_term = s_eff if s_eff is not None else torch.zeros_like(self.S)
+            for frame in range(self.N):
+                py = float(pos[frame, 0].detach().cpu().item())
+                px = float(pos[frame, 1].detach().cpu().item())
+                y0 = int(np.floor(py))
+                x0 = int(np.floor(px))
+                fy = py - y0
+                fx = px - x0
+                plane = self._plane_from_coeffs(self.planes[frame : frame + 1]).squeeze(0)
+                residual = (self.M[frame] - s_term - plane) * self.mask[frame]
+                mask = self.mask[frame]
+                weights = [
+                    ((1.0 - fy) * (1.0 - fx), 0, 0),
+                    ((1.0 - fy) * fx, 0, 1),
+                    (fy * (1.0 - fx), 1, 0),
+                    (fy * fx, 1, 1),
+                ]
+                for weight, dy, dx in weights:
+                    if weight == 0.0:
+                        continue
+                    ys0 = y0 + dy
+                    xs0 = x0 + dx
+                    ys1 = ys0 + self.h
+                    xs1 = xs0 + self.w
+                    ya = max(0, ys0)
+                    yb = min(self.H, ys1)
+                    xa = max(0, xs0)
+                    xb = min(self.W, xs1)
+                    if yb <= ya or xb <= xa:
+                        continue
+                    sy0 = ya - ys0
+                    sx0 = xa - xs0
+                    sy1 = sy0 + (yb - ya)
+                    sx1 = sx0 + (xb - xa)
+                    numerator[ya:yb, xa:xb] += weight * residual[sy0:sy1, sx0:sx1]
+                    denominator[ya:yb, xa:xb] += weight * mask[sy0:sy1, sx0:sx1]
+            valid_t = denominator > 1e-8
+            self.O[valid_t] = numerator[valid_t] / denominator[valid_t]
+            delta = self.O - previous
+            if bool(valid_t.any()):
+                vals = delta[valid_t]
+                return {
+                    "optic_update_rms_nm": float(torch.sqrt((vals**2).mean()).cpu().item()),
+                    "optic_update_pv_nm": float((vals.max() - vals.min()).cpu().item()),
+                }
+        return {"optic_update_rms_nm": 0.0, "optic_update_pv_nm": 0.0}
+
+    def refresh_optic_priors(self) -> None:
+        with torch.no_grad():
+            if self.optic_prior is not None and self.optic_prior_mask is not None:
+                self.optic_prior.copy_(torch.where(self.optic_prior_mask > 0, self.O.detach(), self.optic_prior))
+            if self.curvature_anchor_enabled:
+                self.curvature_prior_coeff.copy_(self._optic_poly_coeff(self.O).detach())
+
+    def initialize_systematic_from_current_residual(self, frame_batch_size: int) -> dict[str, float]:
+        if not self.fit_S or self.S is None:
+            return {}
+        with torch.no_grad():
+            numerator = torch.zeros_like(self.S)
+            denominator = torch.zeros_like(self.S)
+            before_sum = torch.zeros((), dtype=torch.float64, device=self.M.device)
+            before_count = torch.zeros((), dtype=torch.float64, device=self.M.device)
+            for start in range(0, self.N, frame_batch_size):
+                idx = torch.arange(start, min(self.N, start + frame_batch_size), device=self.M.device)
+                optic_sub, inside = self._sample_optic(idx)
+                plane = self._plane_from_coeffs(self.planes[idx])
+                mask = self.mask[idx] * inside
+                residual = (self.M[idx] - optic_sub - plane) * mask
+                numerator += residual.sum(dim=0)
+                denominator += mask.sum(dim=0)
+                before_sum += (residual**2).sum()
+                before_count += mask.sum()
+            estimate = torch.where(denominator > 0, numerator / denominator.clamp_min(1.0), torch.zeros_like(numerator))
+            self.S.copy_(estimate)
+            after_sum = torch.zeros((), dtype=torch.float64, device=self.M.device)
+            after_count = torch.zeros((), dtype=torch.float64, device=self.M.device)
+            for start in range(0, self.N, frame_batch_size):
+                idx = torch.arange(start, min(self.N, start + frame_batch_size), device=self.M.device)
+                optic_sub, inside = self._sample_optic(idx)
+                plane = self._plane_from_coeffs(self.planes[idx])
+                mask = self.mask[idx] * inside
+                s_eff = self.S_effective
+                residual = (self.M[idx] - optic_sub - plane - (s_eff[None] if s_eff is not None else 0.0)) * mask
+                after_sum += (residual**2).sum()
+                after_count += mask.sum()
+            s_eff = self.S_effective
+            s_stats = s_eff if s_eff is not None else self.S
+            return {
+                "systematic_init_before_rms_nm": float(torch.sqrt(before_sum / before_count.clamp_min(1.0)).cpu().item()),
+                "systematic_init_after_rms_nm": float(torch.sqrt(after_sum / after_count.clamp_min(1.0)).cpu().item()),
+                "systematic_init_rms_nm": float(torch.sqrt((s_stats**2).mean()).cpu().item()),
+                "systematic_init_pv_nm": float((s_stats.max() - s_stats.min()).cpu().item()),
+            }
+
+    def project_position_gauge(self) -> None:
+        """Remove unobservable position gauges from the refinement parameters.
+
+        On a 1-D scan, an affine trend in x-position corrections changes the
+        effective scan origin/step and can trade directly against global
+        curvature. Keep only residual frame-to-frame corrections.
+        """
+
+        if self.delta_pos is None:
+            return
+        with torch.no_grad():
+            if self.scan_is_1d:
+                self.delta_pos[:, 0].zero_()
+                if self.N >= 2 and self.position_gauge_design is not None:
+                    design = self.position_gauge_design
+                    coeff = torch.linalg.lstsq(design, self.delta_pos[:, 1:2]).solution
+                    self.delta_pos[:, 1] -= (design @ coeff)[:, 0]
+            else:
+                self.delta_pos -= self.delta_pos.mean(dim=0, keepdim=True)
 
     def build_grid(self, frame_idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         B = len(frame_idx)
@@ -274,23 +564,12 @@ class StitchingModel(nn.Module):
         return grid, inside
 
     def forward_batch(self, frame_idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        grid, inside = self.build_grid(frame_idx)
-        optic_in = self.O[None, None].expand(len(frame_idx), -1, -1, -1)
-        optic_sub = F.grid_sample(
-            optic_in,
-            grid,
-            mode=self.interp_mode,
-            padding_mode="zeros",
-            align_corners=True,
-        ).squeeze(1)
-
-        pl = self.planes[frame_idx]
-        plane = pl[:, 0, None, None] + pl[:, 1, None, None] * self.tilt_u[None] + pl[:, 2, None, None] * self.tilt_v[None]
-        if self.fit_power_per_frame:
-            plane = plane + pl[:, 3, None, None] * self.power_basis[None]
+        optic_sub, inside = self._sample_optic(frame_idx)
+        plane = self._plane_from_coeffs(self.planes[frame_idx])
 
         if self.fit_S:
-            s_term = self.S[None]
+            s_eff = self.S_effective
+            s_term = s_eff[None] if s_eff is not None else 0.0
         elif self.S_fixed is not None:
             s_term = self.S_fixed[None]
         else:
@@ -317,9 +596,9 @@ class StitchingModel(nn.Module):
 
         with torch.no_grad():
             mean_piston = self.planes[:, 0].mean()
-            mean_tilt_u = self.planes[:, 1].mean()
-            mean_tilt_v = self.planes[:, 2].mean()
-            mean_power = self.planes[:, 3].mean() if self.fit_power_per_frame else None
+            mean_tilt_u = self.planes[:, 1].mean() if self.fit_tilt_per_frame else torch.zeros((), dtype=torch.float64, device=self.O.device)
+            mean_tilt_v = self.planes[:, 2].mean() if self.fit_tilt_per_frame else torch.zeros((), dtype=torch.float64, device=self.O.device)
+            mean_power = self.planes[:, self.power_col].mean() if self.fit_power_per_frame and self.power_col is not None else None
 
             y = torch.arange(self.H, dtype=torch.float64, device=self.O.device)
             x = torch.arange(self.W, dtype=torch.float64, device=self.O.device)
@@ -355,11 +634,12 @@ class StitchingModel(nn.Module):
                 )
                 induced_tilt_u = induced_tilt_u + 2.0 * quad_x * center_x_norm * local_to_canvas_x
                 induced_tilt_v = induced_tilt_v + 2.0 * quad_y * center_y_norm * local_to_canvas_y
-                self.planes[:, 3] -= mean_power
+                self.planes[:, self.power_col] -= mean_power
 
             self.planes[:, 0] -= induced_piston
-            self.planes[:, 1] -= induced_tilt_u
-            self.planes[:, 2] -= induced_tilt_v
+            if self.fit_tilt_per_frame:
+                self.planes[:, 1] -= induced_tilt_u
+                self.planes[:, 2] -= induced_tilt_v
 
 
 def batched_loss(
@@ -368,10 +648,14 @@ def batched_loss(
     lam_g: float,
     lam_s: float,
     smoothness: float,
+    seam_smoothness: float,
     plane_l2: float,
     s_l2: float,
     s_smoothness: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    optic_prior_l2: float,
+    position_l2: float,
+    curv_anchor_l2: float,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     device = model.M.device
     loss_sum = torch.zeros((), dtype=torch.float64, device=device)
     valid_sum = torch.zeros((), dtype=torch.float64, device=device)
@@ -403,35 +687,99 @@ def batched_loss(
 
     loss_S_gauge = torch.zeros((), dtype=torch.float64, device=device)
     if model.fit_S and model.S is not None:
-        proj = (model.S[None] * model.S_low_bases).sum(dim=(1, 2))
-        if model.scan_is_1d:
-            weights = torch.tensor([1.0, 1.0, 10.0, 1.0, 10.0, 10.0], dtype=torch.float64, device=device)
-        else:
-            weights = torch.ones(6, dtype=torch.float64, device=device)
-        loss_S_gauge = (weights * proj**2).sum()
+        proj = (model.S_effective[None] * model.S_low_bases).sum(dim=(1, 2))
+        loss_S_gauge = (proj**2).sum()
 
-    loss_plane_l2 = plane_l2 * (model.planes**2).mean()
-    loss_smooth = torch.zeros((), dtype=torch.float64, device=device)
+    if model.planes.shape[1] > 1:
+        raw_plane_l2 = (model.planes[:, 1:]**2).mean()
+    else:
+        raw_plane_l2 = torch.zeros((), dtype=torch.float64, device=device)
+    loss_plane_l2 = plane_l2 * raw_plane_l2
+
+    loss_optic_prior = torch.zeros((), dtype=torch.float64, device=device)
+    if optic_prior_l2 > 0 and model.optic_prior is not None and model.optic_prior_mask is not None:
+        prior_valid = model.optic_prior_mask[model.optic_poly_valid] > 0
+        if bool(prior_valid.any()):
+            prior_values = (model.O - model.optic_prior)[model.optic_poly_valid][prior_valid]
+            design_affine = model.optic_affine_design[prior_valid]
+            if prior_values.numel() >= 3:
+                gram = design_affine.T @ design_affine
+                gram = gram + 1e-12 * torch.eye(3, dtype=torch.float64, device=device)
+                coeff_affine = torch.linalg.solve(gram, design_affine.T @ prior_values)
+                prior_values = prior_values - design_affine @ coeff_affine
+            loss_optic_prior = optic_prior_l2 * (prior_values**2).mean()
+
+    loss_position_prior = torch.zeros((), dtype=torch.float64, device=device)
+    if position_l2 > 0 and model.delta_pos is not None:
+        delta = model.current_positions() - model.scan_positions
+        loss_position_prior = position_l2 * (delta**2).mean()
+
+    raw_smooth = torch.zeros((), dtype=torch.float64, device=device)
     if smoothness > 0:
-        loss_smooth = ((model.O[:, 1:] - model.O[:, :-1]) ** 2).mean() + ((model.O[1:] - model.O[:-1]) ** 2).mean()
+        d2x = model.O[:, 2:] - 2.0 * model.O[:, 1:-1] + model.O[:, :-2]
+        d2y = model.O[2:, :] - 2.0 * model.O[1:-1, :] + model.O[:-2, :]
+        raw_smooth = (d2x**2 * model.optic_lap_valid_x).sum() / model.optic_lap_valid_x.sum().clamp_min(1.0)
+        raw_smooth = raw_smooth + (d2y**2 * model.optic_lap_valid_y).sum() / model.optic_lap_valid_y.sum().clamp_min(1.0)
+    loss_smooth = smoothness * raw_smooth
+
+    raw_seam_smooth = torch.zeros((), dtype=torch.float64, device=device)
+    if seam_smoothness > 0:
+        d2x = model.O[:, 2:] - 2.0 * model.O[:, 1:-1] + model.O[:, :-2]
+        d2y = model.O[2:, :] - 2.0 * model.O[1:-1, :] + model.O[:-2, :]
+        raw_seam_smooth = (d2x**2 * model.optic_seam_lap_weight_x).sum() / (model.optic_seam_lap_weight_x > 0).to(torch.float64).sum().clamp_min(1.0)
+        raw_seam_smooth = raw_seam_smooth + (d2y**2 * model.optic_seam_lap_weight_y).sum() / (model.optic_seam_lap_weight_y > 0).to(torch.float64).sum().clamp_min(1.0)
+    loss_seam_smooth = seam_smoothness * raw_seam_smooth
+
     loss_s_prior = torch.zeros((), dtype=torch.float64, device=device)
     if model.fit_S and model.S is not None:
-        if s_l2 > 0:
-            loss_s_prior = loss_s_prior + s_l2 * (model.S**2).mean()
-        if s_smoothness > 0:
-            loss_s_prior = loss_s_prior + s_smoothness * (
-                ((model.S[:, 1:] - model.S[:, :-1]) ** 2).mean()
-                + ((model.S[1:] - model.S[:-1]) ** 2).mean()
-            )
-    return (
+        s_eff = model.S_effective
+        if s_eff is not None:
+            if s_l2 > 0:
+                loss_s_prior = loss_s_prior + s_l2 * (s_eff**2).mean()
+            if s_smoothness > 0:
+                loss_s_prior = loss_s_prior + s_smoothness * (
+                    ((s_eff[:, 1:] - s_eff[:, :-1]) ** 2).mean()
+                    + ((s_eff[1:] - s_eff[:-1]) ** 2).mean()
+                )
+
+    loss_curv_anchor = torch.zeros((), dtype=torch.float64, device=device)
+    if curv_anchor_l2 > 0 and model.curvature_anchor_enabled:
+        coeff = model._optic_poly_coeff(model.O)
+        dq = coeff[3:5] - model.curvature_prior_coeff[3:5]
+        loss_curv_anchor = curv_anchor_l2 * (dq**2).sum()
+
+    weighted_univ_gauge = lam_g * loss_univ_gauge
+    weighted_S_gauge = lam_s * loss_S_gauge
+    total = (
         loss_data
-        + lam_g * loss_univ_gauge
-        + lam_s * loss_S_gauge
+        + weighted_univ_gauge
+        + weighted_S_gauge
         + loss_plane_l2
-        + smoothness * loss_smooth
-        + loss_s_prior,
-        loss_data,
+        + loss_optic_prior
+        + loss_position_prior
+        + loss_smooth
+        + loss_seam_smooth
+        + loss_s_prior
+        + loss_curv_anchor
     )
+    components = {
+        "total": total.detach(),
+        "data": loss_data.detach(),
+        "univ_gauge": weighted_univ_gauge.detach(),
+        "S_gauge": weighted_S_gauge.detach(),
+        "plane_l2": loss_plane_l2.detach(),
+        "optic_prior": loss_optic_prior.detach(),
+        "position_prior": loss_position_prior.detach(),
+        "smoothness": loss_smooth.detach(),
+        "seam_smoothness": loss_seam_smooth.detach(),
+        "s_prior": loss_s_prior.detach(),
+        "curv_anchor": loss_curv_anchor.detach(),
+        "raw_univ_gauge": loss_univ_gauge.detach(),
+        "raw_S_gauge": loss_S_gauge.detach(),
+        "raw_smoothness": raw_smooth.detach(),
+        "raw_seam_smoothness": raw_seam_smooth.detach(),
+    }
+    return total, loss_data, components
 
 def reconstruct_stitching(
     measurements: np.ndarray,
@@ -448,6 +796,7 @@ def reconstruct_stitching(
     aperture_feather: int = 4,
     min_output_coverage: float = 0.15,
     smoothness: float = 0.0,
+    seam_smoothness: float = 0.0,
     plane_l2: float = 0.0,
     s_l2: float = 0.0,
     s_smoothness: float = 0.0,
@@ -455,11 +804,21 @@ def reconstruct_stitching(
     device: str = "cpu",
     phase1_iters: int = 100,
     phase2_iters: int = 500,
-    phase3_iters: int = 30,
+    phase3_iters: int = 0,
     step_px: float | None = None,
     initial_optic: np.ndarray | None = None,
+    anchor_curvature: bool = True,
+    s_init: str = "mean",
+    s_init_iters: int = 3,
+    optic_prior_l2: float = 0.005,
+    position_l2: float = 1.0,
+    curv_anchor_l2: float = 100.0,
+    lam_g: float = 1e-6,
+    lam_s: float = 1.0,
+    accept_tol: float = 1.05,
+    rollback_factor: float = 1.5,
     lr_o: float = 1e-1,
-    lr_s: float = 1e-2,
+    lr_s: float = 5e-3,
     lr_planes: float = 1e-2,
     lr_pos: float = 1e-3,
     verbose: bool = True,
@@ -486,20 +845,161 @@ def reconstruct_stitching(
         min_output_coverage=min_output_coverage,
         step_px=step_px,
         initial_optic=initial_optic,
+        anchor_curvature=anchor_curvature,
         device=device,
     )
 
     history: list[dict[str, Any]] = []
+    systematic_init_summary: dict[str, float] | None = None
 
-    def log(phase: str, step: int, loss_data: torch.Tensor) -> None:
+    def log(
+        phase: str,
+        step: int,
+        loss_data: torch.Tensor,
+        *,
+        components: dict[str, torch.Tensor] | None = None,
+        accepted: bool | None = None,
+        status: str | None = None,
+    ) -> None:
         rms = float(torch.sqrt(loss_data.detach()).cpu().item())
         rec = {"phase": phase, "step": step, "rms": rms}
+        if components is not None:
+            for key, value in components.items():
+                rec[f"loss_{key}"] = float(value.detach().cpu().item())
+        if accepted is not None:
+            rec["accepted"] = accepted
+        if status is not None:
+            rec["status"] = status
         if model.fit_positions:
             pos = model.current_positions().detach().cpu().numpy()
             rec["position_rms_delta"] = float(np.sqrt(np.mean((pos - scan_positions) ** 2)))
         history.append(rec)
         if verbose:
-            print(f"  {phase} {step}: RMS={rms:.6g}")
+            status_text = f" {status}" if status else (" accepted" if accepted is True else (" restored" if accepted is False else ""))
+            total_text = ""
+            if components is not None and "total" in components:
+                total_text = f", total={float(components['total'].detach().cpu().item()):.6g}"
+            print(f"  {phase} {step}: RMS={rms:.6g}{total_text}{status_text}")
+
+    def data_loss_only() -> torch.Tensor:
+        _, loss_data, _ = batched_loss(
+            model,
+            frame_batch_size,
+            lam_g=0.0,
+            lam_s=0.0,
+            smoothness=0.0,
+            seam_smoothness=0.0,
+            plane_l2=0.0,
+            s_l2=0.0,
+            s_smoothness=0.0,
+            optic_prior_l2=0.0,
+            position_l2=0.0,
+            curv_anchor_l2=0.0,
+        )
+        return loss_data.detach()
+
+    def optimization_loss(use_smoothness: float) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        return batched_loss(
+            model,
+            frame_batch_size,
+            lam_g=lam_g,
+            lam_s=lam_s if fit_S else 0.0,
+            smoothness=use_smoothness,
+            seam_smoothness=seam_smoothness,
+            plane_l2=plane_l2,
+            s_l2=s_l2,
+            s_smoothness=s_smoothness,
+            optic_prior_l2=optic_prior_l2,
+            position_l2=position_l2,
+            curv_anchor_l2=curv_anchor_l2 if model.curvature_anchor_enabled else 0.0,
+        )
+
+    def snapshot_state() -> dict[str, torch.Tensor | None]:
+        return {
+            "O": model.O.detach().clone(),
+            "planes": model.planes.detach().clone(),
+            "S": model.S.detach().clone() if model.S is not None else None,
+            "delta_pos": model.delta_pos.detach().clone() if model.delta_pos is not None else None,
+        }
+
+    def restore_state(state: dict[str, torch.Tensor | None]) -> None:
+        with torch.no_grad():
+            model.O.copy_(state["O"])
+            model.planes.copy_(state["planes"])
+            if model.S is not None and state["S"] is not None:
+                model.S.copy_(state["S"])
+            if model.delta_pos is not None and state["delta_pos"] is not None:
+                model.delta_pos.copy_(state["delta_pos"])
+
+    def accept_or_restore(
+        candidate_loss: torch.Tensor,
+        best_loss: torch.Tensor,
+        best_state: dict[str, torch.Tensor | None],
+        opt: torch.optim.Optimizer | None = None,
+        best_opt_state: dict[str, Any] | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor | None], dict[str, Any] | None, bool | None, str]:
+        candidate = float(candidate_loss.detach().cpu().item())
+        best = float(best_loss.detach().cpu().item())
+        if candidate <= best * accept_tol:
+            opt_state = copy.deepcopy(opt.state_dict()) if opt is not None else best_opt_state
+            return candidate_loss.detach(), snapshot_state(), opt_state, True, "accepted"
+        if candidate > best * rollback_factor:
+            restore_state(best_state)
+            if opt is not None and best_opt_state is not None:
+                opt.load_state_dict(best_opt_state)
+            return best_loss, best_state, best_opt_state, False, "restored"
+        return best_loss, best_state, best_opt_state, None, "kept"
+
+    initial_loss, initial_loss_data, initial_components = batched_loss(
+        model,
+        frame_batch_size,
+        lam_g=0.0,
+        lam_s=0.0,
+        smoothness=0.0,
+        seam_smoothness=0.0,
+        plane_l2=0.0,
+        s_l2=0.0,
+        s_smoothness=0.0,
+        optic_prior_l2=0.0,
+        position_l2=0.0,
+        curv_anchor_l2=0.0,
+    )
+    log("initial", 0, initial_loss_data, components=initial_components)
+
+    if fit_S and s_init != "none":
+        init_records = []
+        for init_step in range(max(1, s_init_iters)):
+            systematic_init_summary = model.initialize_systematic_from_current_residual(frame_batch_size)
+            model.initialize_planes_from_current_optic()
+            before_o_update_loss, before_o_update_data, _ = optimization_loss(0.0)
+            before_o_update_state = snapshot_state()
+            optic_update_summary = model.update_optic_from_current_terms()
+            model.initialize_planes_from_current_optic()
+            after_o_update_loss, after_o_update_data, _ = optimization_loss(0.0)
+            data_ok = float(after_o_update_data.detach().cpu().item()) <= float(before_o_update_data.detach().cpu().item()) * accept_tol
+            total_ok = float(after_o_update_loss.detach().cpu().item()) <= float(before_o_update_loss.detach().cpu().item()) * accept_tol
+            if data_ok and total_ok:
+                o_update_accepted = True
+                s_init_loss_data = after_o_update_data.detach()
+            else:
+                restore_state(before_o_update_state)
+                o_update_accepted = False
+                optic_update_summary = {key: 0.0 for key in optic_update_summary}
+                s_init_loss_data = before_o_update_data.detach()
+            init_records.append({
+                "iteration": init_step + 1,
+                **systematic_init_summary,
+                **optic_update_summary,
+                "optic_update_accepted": o_update_accepted,
+                "after_coordinate_update_rms_nm": float(torch.sqrt(s_init_loss_data).cpu().item()),
+            })
+            log("s_init", init_step + 1, s_init_loss_data, accepted=o_update_accepted)
+        systematic_init_summary = {"iterations": init_records}
+        model.refresh_optic_priors()
+
+    best_loss, best_loss_data, best_components = optimization_loss(0.0)
+    best_loss = best_loss.detach()
+    best_state = snapshot_state()
 
     # Phase 1: planes and S only, O frozen.
     model.O.requires_grad_(False)
@@ -507,27 +1007,27 @@ def reconstruct_stitching(
     if fit_S:
         params.append({"params": [model.S], "lr": lr_s})
     opt = torch.optim.Adam(params)
+    best_opt_state = copy.deepcopy(opt.state_dict())
     for step in range(max(0, phase1_iters)):
         opt.zero_grad(set_to_none=True)
-        loss, loss_data = batched_loss(
-            model,
-            frame_batch_size,
-            lam_g=1.0,
-            lam_s=1e3 if fit_S else 0.0,
-            smoothness=0.0,
-            plane_l2=plane_l2,
-            s_l2=s_l2,
-            s_smoothness=s_smoothness,
-        )
+        loss, loss_data, components = optimization_loss(0.0)
         loss.backward()
         opt.step()
+        candidate_loss, candidate_loss_data, candidate_components = optimization_loss(0.0)
+        best_loss, best_state, best_opt_state, accepted, status = accept_or_restore(
+            candidate_loss.detach(), best_loss, best_state, opt, best_opt_state
+        )
         if step == 0 or (step + 1) % 50 == 0 or step == phase1_iters - 1:
-            log("phase1", step + 1, loss_data)
+            log("phase1", step + 1, candidate_loss_data.detach(), components=candidate_components, accepted=accepted, status=status)
 
+    restore_state(best_state)
     model.project_mean_plane_to_optic()
 
     # Phase 2: joint Adam.
     model.project_mean_plane_to_optic()
+    best_loss, best_loss_data, best_components = optimization_loss(smoothness)
+    best_loss = best_loss.detach()
+    best_state = snapshot_state()
     model.O.requires_grad_(True)
     params = [{"params": [model.O], "lr": lr_o}, {"params": [model.planes], "lr": lr_planes}]
     if fit_S:
@@ -535,29 +1035,26 @@ def reconstruct_stitching(
     if fit_positions:
         params.append({"params": [model.delta_pos], "lr": lr_pos})
     opt = torch.optim.Adam(params)
+    best_opt_state = copy.deepcopy(opt.state_dict())
     for step in range(max(0, phase2_iters)):
         opt.zero_grad(set_to_none=True)
-        loss, loss_data = batched_loss(
-            model,
-            frame_batch_size,
-            lam_g=1.0,
-            lam_s=1e3 if fit_S else 0.0,
-            smoothness=smoothness,
-            plane_l2=plane_l2,
-            s_l2=s_l2,
-            s_smoothness=s_smoothness,
-        )
+        loss, loss_data, components = optimization_loss(smoothness)
         loss.backward()
         opt.step()
-        if model.scan_is_1d and model.delta_pos is not None:
-            model.delta_pos.data[:, 0] = 0.0
+        model.project_position_gauge()
         if phase2_iters > 0 and step + 1 == max(1, phase2_iters // 2):
             model.project_mean_plane_to_optic()
+        candidate_loss, candidate_loss_data, candidate_components = optimization_loss(smoothness)
+        best_loss, best_state, best_opt_state, accepted, status = accept_or_restore(
+            candidate_loss.detach(), best_loss, best_state, opt, best_opt_state
+        )
         if step == 0 or (step + 1) % 50 == 0 or step == phase2_iters - 1:
-            log("phase2", step + 1, loss_data)
+            log("phase2", step + 1, candidate_loss_data.detach(), components=candidate_components, accepted=accepted, status=status)
 
+    restore_state(best_state)
     if fit_positions and model.delta_pos is not None:
         model.delta_pos.requires_grad_(False)
+    phase3_skipped_reason = None
     if phase3_iters > 0:
         lbfgs_params = [model.O, model.planes]
         if fit_S and model.S is not None:
@@ -575,32 +1072,28 @@ def reconstruct_stitching(
         def closure() -> torch.Tensor:
             nonlocal last_loss_data
             opt.zero_grad(set_to_none=True)
-            loss, loss_data = batched_loss(
-                model,
-                frame_batch_size,
-                lam_g=1.0,
-                lam_s=1e3 if fit_S else 0.0,
-                smoothness=smoothness,
-                plane_l2=plane_l2,
-                s_l2=s_l2,
-                s_smoothness=s_smoothness,
-            )
+            loss, loss_data, components = optimization_loss(smoothness)
             loss.backward()
             last_loss_data = loss_data.detach()
             return loss
 
         for step in range(phase3_iters):
             opt.step(closure)
+            model.project_position_gauge()
             if step == 0 or (step + 1) % 5 == 0 or step == phase3_iters - 1:
-                log("phase3", step + 1, last_loss_data)
+                final_loss, final_loss_data, final_components = optimization_loss(smoothness)
+                log("phase3", step + 1, final_loss_data.detach(), components=final_components)
 
     model.project_mean_plane_to_optic()
+    model.project_position_gauge()
+    final_curvature_coeff = model._optic_poly_coeff(model.O).detach()
     residuals, reconstructed = evaluate_model(model, frame_batch_size)
     optic = model.O.detach().cpu().numpy().astype(np.float64)
     observed = model.optic_observed_mask.detach().cpu().numpy().astype(np.float64)
     quality = model.optic_quality_mask.detach().cpu().numpy().astype(np.float64)
     optic[quality <= min_output_coverage] = np.nan
-    systematic = model.S.detach().cpu().numpy().astype(np.float64) if fit_S else None
+    s_eff = model.S_effective
+    systematic = s_eff.detach().cpu().numpy().astype(np.float64) if fit_S and s_eff is not None else None
     planes = model.planes.detach().cpu().numpy().astype(np.float64)
     positions = model.current_positions().detach().cpu().numpy().astype(np.float64)
     summary = {
@@ -611,15 +1104,35 @@ def reconstruct_stitching(
         "scan_is_1d": model.scan_is_1d,
         "max_delta_pos": model.max_delta_pos,
         "phase3_iters": phase3_iters,
+        "phase3_skipped_reason": phase3_skipped_reason,
         "fit_S": fit_S,
+        "s_init": s_init if fit_S else None,
+        "s_init_iters": s_init_iters if fit_S else 0,
+        "systematic_init_summary": systematic_init_summary,
         "fit_positions": fit_positions,
         "fit_power_per_frame": fit_power_per_frame,
         "plane_order": plane_order,
         "initial_optic": "sequential" if initial_optic is not None else "warm_average",
+        "curvature_anchor": bool(anchor_curvature and initial_optic is not None),
+        "curvature_anchor_coeff_normalized": model.curvature_prior_coeff.detach().cpu().numpy().tolist() if model.curvature_anchor_enabled else None,
+        "curvature_final_coeff_normalized": final_curvature_coeff.cpu().numpy().tolist(),
+        "curvature_anchor_delta_normalized": (final_curvature_coeff - model.curvature_prior_coeff).cpu().numpy().tolist() if model.curvature_anchor_enabled else None,
+        "optic_prior_l2": optic_prior_l2,
+        "position_l2": position_l2,
+        "curv_anchor_l2": curv_anchor_l2,
+        "lam_g": lam_g,
+        "lam_s": lam_s if fit_S else 0.0,
+        "accept_tol": accept_tol,
+        "rollback_factor": rollback_factor,
+        "position_gauge": "1d_zero_y_and_remove_x_affine" if model.scan_is_1d and fit_positions else ("remove_mean_xy" if fit_positions else None),
+        "position_delta_rms_px": float(np.sqrt(np.mean((positions - scan_positions) ** 2))) if fit_positions else 0.0,
+        "position_delta_pv_px": finite_pv(positions - scan_positions) if fit_positions else 0.0,
         "interp_mode": interp_mode,
         "aperture_feather": aperture_feather,
         "min_output_coverage": min_output_coverage,
         "plane_l2": plane_l2,
+        "smoothness": smoothness,
+        "seam_smoothness": seam_smoothness,
         "s_l2": s_l2,
         "s_smoothness": s_smoothness,
     }
@@ -645,6 +1158,33 @@ def evaluate_model(model: StitchingModel, frame_batch_size: int) -> tuple[np.nda
 def align_offset(a: np.ndarray, b: np.ndarray) -> float:
     valid = np.isfinite(a) & np.isfinite(b)
     return float(np.nanmean(a[valid] - b[valid])) if np.any(valid) else 0.0
+
+
+def aligned_difference_remove_piston_tilt(
+    a: np.ndarray,
+    b: np.ndarray,
+    pixel_spacing: tuple[float, float] | None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    h, w = a.shape
+    sy_mm, sx_mm = pixel_spacing if pixel_spacing is not None else (1.0, 1.0)
+    y = (np.arange(h, dtype=np.float64) - (h - 1) / 2.0) * sy_mm
+    x = (np.arange(w, dtype=np.float64) - (w - 1) / 2.0) * sx_mm
+    yy, xx = np.meshgrid(y, x, indexing="ij")
+    valid = np.isfinite(a) & np.isfinite(b)
+    diff = np.full_like(a, np.nan, dtype=np.float64)
+    if np.count_nonzero(valid) < 3:
+        return diff, {"error": "not enough common pixels", "valid_pixels": int(np.count_nonzero(valid))}
+    raw = a - b
+    design = np.column_stack([np.ones(np.count_nonzero(valid)), xx[valid], yy[valid]])
+    coeff, *_ = np.linalg.lstsq(design, raw[valid], rcond=None)
+    trend = coeff[0] + coeff[1] * xx + coeff[2] * yy
+    diff[valid] = raw[valid] - trend[valid]
+    return diff, {
+        "model": "difference_nm = c + bx*x_mm + by*y_mm + residual; c/bx/by removed",
+        "coeff_names": ["c_nm", "bx_nm_per_mm", "by_nm_per_mm"],
+        "coefficients": [float(v) for v in coeff],
+        "valid_pixels": int(np.count_nonzero(valid)),
+    }
 
 
 def finite_pv(values: np.ndarray) -> float:
@@ -961,12 +1501,38 @@ def save_figures(result: StitchingResult, data: dict[str, Any], output_dir: Path
     plt.close(fig)
 
     if result.loss_history:
+        x = np.arange(len(result.loss_history))
+        fig, ax = plt.subplots(figsize=(7.5, 4.8), constrained_layout=True)
+        component_keys = [
+            "loss_total",
+            "loss_data",
+            "loss_optic_prior",
+            "loss_plane_l2",
+            "loss_curv_anchor",
+            "loss_s_prior",
+            "loss_smoothness",
+            "loss_seam_smoothness",
+            "loss_position_prior",
+            "loss_univ_gauge",
+        ]
+        for key in component_keys:
+            y = np.array([float(r.get(key, np.nan)) for r in result.loss_history], dtype=np.float64)
+            valid = np.isfinite(y) & (y > 0)
+            if np.any(valid):
+                ax.semilogy(x[valid], y[valid], marker="o", label=key.replace("loss_", ""))
+        ax.set_xlabel("logged step")
+        ax.set_ylabel("loss value (nm^2 or weighted term)")
+        ax.grid(True, alpha=0.3, which="both")
+        ax.legend(loc="best", fontsize=8)
+        fig.savefig(output_dir / "loss_history.png", dpi=160)
+        plt.close(fig)
+
         fig, ax = plt.subplots(figsize=(6, 4), constrained_layout=True)
         ax.plot([r["rms"] for r in result.loss_history], marker="o")
         ax.set_xlabel("logged step")
-        ax.set_ylabel("RMS residual")
+        ax.set_ylabel("RMS residual (nm)")
         ax.grid(True, alpha=0.3)
-        fig.savefig(output_dir / "loss_history.png", dpi=160)
+        fig.savefig(output_dir / "rms_history.png", dpi=160)
         plt.close(fig)
 
 
@@ -1092,6 +1658,7 @@ def run(args: argparse.Namespace) -> None:
     summary: dict[str, Any] = {
         "mode": args.mode,
         "adp_init": args.adp_init,
+        "adp_curvature_anchor": args.adp_curvature_anchor,
         "input": str(Path(args.input)) if not args.raw_dir else None,
         "raw_dir": args.raw_dir,
         "input_local_second_order": local_second_order_statistics(data["measurements"], data["masks"], pixel_spacing),
@@ -1161,6 +1728,7 @@ def run(args: argparse.Namespace) -> None:
             aperture_feather=0,
             min_output_coverage=args.min_output_coverage,
             smoothness=args.smoothness,
+            seam_smoothness=args.seam_smoothness,
             plane_l2=args.plane_l2,
             s_l2=args.s_l2,
             s_smoothness=args.s_smoothness,
@@ -1171,6 +1739,16 @@ def run(args: argparse.Namespace) -> None:
             phase3_iters=args.phase3_iters,
             step_px=step_px_from_data(data),
             initial_optic=initial_optic,
+            anchor_curvature=args.adp_curvature_anchor == "initial",
+            s_init=args.s_init,
+            s_init_iters=args.s_init_iters,
+            optic_prior_l2=args.adp_prior_l2,
+            position_l2=args.position_l2,
+            curv_anchor_l2=args.curv_anchor_l2,
+            lam_g=args.lam_g,
+            lam_s=args.lam_s,
+            accept_tol=args.accept_tol,
+            rollback_factor=args.rollback_factor,
             lr_o=args.lr_o,
             lr_s=args.lr_s,
             lr_planes=args.lr_planes,
@@ -1183,6 +1761,9 @@ def run(args: argparse.Namespace) -> None:
         save_tiff(output_dir / "quality_coverage.tiff", result.quality_mask)
         save_tiff(output_dir / "recovered_optic.tiff", result.optic)
         save_map_figure(output_dir / "recovered_optic.png", result.optic, "ADP/autodiff recovered optic before 2nd-order fit")
+        if result.systematic is not None:
+            save_tiff(output_dir / "systematic_map.tiff", result.systematic)
+            save_map_figure(output_dir / "systematic_map.png", result.systematic, "detector-fixed aperture systematic S")
 
         optic_second_order_fit, optic_second_order_residual, second_order_summary = fit_second_order_surface(
             result.optic,
@@ -1212,17 +1793,39 @@ def run(args: argparse.Namespace) -> None:
         summary["second_order_fit"] = second_order_summary
 
     if args.mode == "both" and result is not None and sequential_optic is not None:
-        sequential_offset = align_offset(result.optic, sequential_optic)
-        sequential_difference = result.optic - sequential_optic - sequential_offset
-        sequential_difference[~(np.isfinite(result.optic) & np.isfinite(sequential_optic))] = np.nan
-        save_tiff(output_dir / "autodiff_minus_sequential.tiff", sequential_difference)
-        save_map_figure(output_dir / "autodiff_minus_sequential.png", sequential_difference, "ADP/autodiff optic minus sequential overlap baseline")
-        output_arrays["autodiff_minus_sequential"] = sequential_difference
+        raw_difference, raw_alignment = aligned_difference_remove_piston_tilt(result.optic, sequential_optic, pixel_spacing)
+        save_tiff(output_dir / "autodiff_minus_sequential_raw_aligned.tiff", raw_difference)
+        save_map_figure(
+            output_dir / "autodiff_minus_sequential_raw_aligned.png",
+            raw_difference,
+            "ADP/autodiff optic minus sequential after piston/tilt alignment",
+        )
+        output_arrays["autodiff_minus_sequential_raw_aligned"] = raw_difference
+
+        residual_difference = optic_second_order_residual - sequential_second_order_residual
+        valid_residual_difference = np.isfinite(optic_second_order_residual) & np.isfinite(sequential_second_order_residual)
+        residual_difference[~valid_residual_difference] = np.nan
+        save_tiff(output_dir / "autodiff_minus_sequential.tiff", residual_difference)
+        save_map_figure(
+            output_dir / "autodiff_minus_sequential.png",
+            residual_difference,
+            "ADP residual minus sequential residual after independent 2nd-order fits",
+        )
+        save_tiff(output_dir / "autodiff_second_order_residual_minus_sequential.tiff", residual_difference)
+        save_map_figure(
+            output_dir / "autodiff_second_order_residual_minus_sequential.png",
+            residual_difference,
+            "ADP residual minus sequential residual after independent 2nd-order fits",
+        )
+        output_arrays["autodiff_minus_sequential"] = residual_difference
+        output_arrays["autodiff_second_order_residual_minus_sequential"] = residual_difference
         summary["autodiff_vs_sequential"] = {
-            "difference_rms_nm": finite_rms(sequential_difference),
-            "difference_pv_nm": finite_pv(sequential_difference),
-            "difference_mean_offset_removed_nm": sequential_offset,
-            "interpretation": "Large low-order disagreement in 1-D scans indicates ADP gauge ambiguity between global curvature and per-frame planes/position terms; sequential overlap is the more direct curvature-preserving baseline.",
+            "residual_difference_rms_nm": finite_rms(residual_difference),
+            "residual_difference_pv_nm": finite_pv(residual_difference),
+            "raw_aligned_difference_rms_nm": finite_rms(raw_difference),
+            "raw_aligned_difference_pv_nm": finite_pv(raw_difference),
+            "raw_alignment_removed": raw_alignment,
+            "interpretation": "autodiff_minus_sequential now compares the two second-order residual maps, which is the meaningful figure-error comparison. The raw piston/tilt-aligned optic difference is saved separately as autodiff_minus_sequential_raw_aligned.",
         }
 
     np.savez_compressed(output_dir / "stitching_result.npz", **output_arrays)
@@ -1236,6 +1839,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="stitching_outputs")
     parser.add_argument("--mode", default="both", choices=["sequential", "autodiff", "both"], help="Calculation mode: sequential overlap stitching, ADP/autodiff global optimization, or both.")
     parser.add_argument("--adp-init", default="sequential", choices=["sequential", "warm_average"], help="Initial optic for ADP/autodiff. sequential uses overlap stitching as warm start; warm_average uses the internal averaged warm start.")
+    parser.add_argument("--adp-curvature-anchor", default="initial", choices=["initial", "none"], help="Keep ADP global x^2/y^2 curvature tied to its initial optic. Recommended for 1-D scans.")
+    parser.add_argument("--adp-prior-l2", type=float, default=0.005, help="L2 prior that keeps ADP optic corrections close to the refreshed initial optic; use 0 to disable.")
+    parser.add_argument("--curv-anchor-l2", type=float, default=100.0, help="Soft L2 penalty tying ADP x^2/y^2 curvature to the refreshed initial optic. Replaces hard projection.")
+    parser.add_argument("--lam-g", type=float, default=1e-6, help="Weight for universal O/plane gauge diagnostics. Keep tiny for curved 1-D scans so gauge terms do not dominate data fitting.")
+    parser.add_argument("--lam-s", type=float, default=1.0, help="Weight for the residual S gauge penalty. S is gauge-projected in the forward model, so this can stay small.")
+    parser.add_argument("--accept-tol", type=float, default=1.05, help="Accept a candidate ADP state as the new best when total loss is within this factor of the best loss.")
+    parser.add_argument("--rollback-factor", type=float, default=1.5, help="Restore the best ADP state and Adam state only when total loss exceeds this factor of the best loss.")
     parser.add_argument("--raw-dir", default=None, help="Folder of interferometer ASC files to stitch instead of --input NPZ.")
     parser.add_argument("--raw-glob", default="*.asc", help="Glob for raw ASC frames inside --raw-dir.")
     parser.add_argument("--raw-grid-y", type=int, default=3, help="Number of scan rows for raw ASC data.")
@@ -1248,23 +1858,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--raw-serpentine", action="store_true", help="Interpret alternate raw scan rows as reversed in X.")
     parser.add_argument("--raw-subtract-median", action="store_true", help="Subtract each raw frame median before stitching.")
     parser.add_argument("--fit-s", action="store_true", help="Jointly recover interferometer systematic S.")
+    parser.add_argument("--s-init", default="mean", choices=["none", "mean"], help="Initialize fitted S from detector-coordinate mean residual after sequential warm start.")
+    parser.add_argument("--s-init-iters", type=int, default=3, help="Closed-form alternating S/plane initialization iterations before Adam.")
     parser.add_argument("--use-known-s", action="store_true", help="Use systematic_true from simulation as fixed S.")
     parser.add_argument("--fit-positions", action="store_true")
     parser.add_argument("--fit-power", action="store_true")
     parser.add_argument("--plane-order", default="tilt", choices=["piston", "tilt"], help="Per-frame low-order alignment model. Tilt helps overlap alignment; avoid --fit-power when fitting curvature.")
     parser.add_argument("--interp-mode", default="bilinear", choices=["bilinear", "bicubic"])
     parser.add_argument("--aperture-feather", type=int, default=0, help="Deprecated/ignored: aperture feathering is disabled because it induced stripes.")
-    parser.add_argument("--min-output-coverage", type=float, default=0.15, help="Hide optic pixels below this normalized soft coverage.")
-    parser.add_argument("--smoothness", type=float, default=0.0)
-    parser.add_argument("--plane-l2", type=float, default=0.0, help="L2 penalty on per-frame plane/power coefficients.")
-    parser.add_argument("--s-l2", type=float, default=0.0, help="L2 penalty on jointly fitted systematic S.")
-    parser.add_argument("--s-smoothness", type=float, default=0.0, help="Gradient smoothness penalty on jointly fitted systematic S.")
+    parser.add_argument("--min-output-coverage", type=float, default=0.15, help="Hide optic pixels below this normalized coverage.")
+    parser.add_argument("--smoothness", type=float, default=0.0, help="Coverage-aware second-difference smoothness on the recovered optic O. Penalizes small-scale ripple without strongly penalizing curvature.")
+    parser.add_argument("--seam-smoothness", type=float, default=0.0, help="Coverage-edge second-difference penalty on O. Use this to suppress jumps/kinks at aperture/overlap boundaries without flattening mirror slope.")
+    parser.add_argument("--plane-l2", type=float, default=0.0, help="L2 penalty on per-frame tilt/power coefficients; piston is never penalized.")
+    parser.add_argument("--position-l2", type=float, default=1.0, help="L2 penalty on refined position corrections in pixel units when --fit-positions is used.")
+    parser.add_argument("--s-l2", type=float, default=1e-4, help="L2 penalty on the gauge-projected jointly fitted systematic S.")
+    parser.add_argument("--s-smoothness", type=float, default=1e-4, help="Gradient smoothness penalty on the gauge-projected jointly fitted systematic S.")
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--phase1-iters", type=int, default=100)
-    parser.add_argument("--phase2-iters", type=int, default=500)
-    parser.add_argument("--phase3-iters", type=int, default=30, help="L-BFGS polish iterations after joint Adam.")
-    parser.add_argument("--lr-o", type=float, default=1e-1)
-    parser.add_argument("--lr-s", type=float, default=1e-2)
+    parser.add_argument("--phase1-iters", type=int, default=0)
+    parser.add_argument("--phase2-iters", type=int, default=300)
+    parser.add_argument("--phase3-iters", type=int, default=0, help="Optional L-BFGS polish iterations after joint Adam. Keep 0 for curvature-anchored 1-D scans.")
+    parser.add_argument("--lr-o", type=float, default=2e-2)
+    parser.add_argument("--lr-s", type=float, default=5e-3)
     parser.add_argument("--lr-planes", type=float, default=1e-2)
     parser.add_argument("--lr-pos", type=float, default=1e-3)
     parser.add_argument("--device", default="cpu")
