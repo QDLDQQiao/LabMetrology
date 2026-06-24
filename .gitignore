@@ -1,0 +1,12 @@
+# Ignore everything by default
+*
+
+# Allow traversing directories
+!*/
+
+# Keep this file tracked
+!.gitignore
+
+# Keep only Python scripts and Jupyter notebooks
+!*.py
+!*.ipynb
