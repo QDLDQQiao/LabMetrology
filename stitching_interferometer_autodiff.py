@@ -7,7 +7,8 @@ import argparse
 import copy
 import json
 import os
-import re
+import platform
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -97,6 +98,70 @@ def warm_start_optic(
     valid = denominator > 0
     optic[valid] = numerator[valid] / denominator[valid]
     return optic, denominator
+
+
+def make_legendre2d_basis(
+    shape: tuple[int, int],
+    *,
+    order: int = 10,
+    order_x: int | None = None,
+    order_y: int | None = None,
+    total_degree: bool = True,
+) -> tuple[np.ndarray, list[tuple[int, int]]]:
+    """Create 2D Legendre-product basis maps on normalized canvas coordinates."""
+
+    H, W = shape
+    ox = order if order_x is None else order_x
+    oy = order if order_y is None else order_y
+    x = np.linspace(-1.0, 1.0, W, dtype=np.float64)
+    y = np.linspace(-1.0, 1.0, H, dtype=np.float64)
+    vx = np.polynomial.legendre.legvander(x, ox)
+    vy = np.polynomial.legendre.legvander(y, oy)
+    maps = []
+    terms = []
+    for iy in range(oy + 1):
+        for ix in range(ox + 1):
+            if total_degree and order_x is None and order_y is None and ix + iy > order:
+                continue
+            maps.append(np.outer(vy[:, iy], vx[:, ix]))
+            terms.append((ix, iy))
+    return np.asarray(maps, dtype=np.float64), terms
+
+
+def fit_basis_coefficients(
+    image: np.ndarray,
+    basis: np.ndarray,
+    weight: np.ndarray | None = None,
+) -> np.ndarray:
+    """Least-squares fit image ~= sum_k coeff[k] * basis[k]."""
+
+    valid = np.isfinite(image)
+    if weight is not None:
+        valid &= np.isfinite(weight) & (weight > 0)
+    if np.count_nonzero(valid) < basis.shape[0]:
+        return np.zeros(basis.shape[0], dtype=np.float64)
+    A = basis[:, valid].T
+    b = image[valid]
+    if weight is not None:
+        w = np.sqrt(weight[valid])
+        A = A * w[:, None]
+        b = b * w
+    coeff, *_ = np.linalg.lstsq(A, b, rcond=None)
+    return coeff.astype(np.float64)
+
+
+def remove_low_order_legendre(
+    image: np.ndarray,
+    *,
+    order: int,
+    weight: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, list[tuple[int, int]]]:
+    basis, terms = make_legendre2d_basis(image.shape, order=order, total_degree=True)
+    coeff = fit_basis_coefficients(image, basis, weight=weight)
+    low = np.tensordot(coeff, basis, axes=(0, 0))
+    high = image - low
+    high[~np.isfinite(image)] = 0.0
+    return high, coeff, terms
 
 
 def scan_condition(positions: np.ndarray) -> tuple[float, np.ndarray]:
@@ -189,6 +254,11 @@ class StitchingModel(nn.Module):
         step_px: float | None = None,
         initial_optic: np.ndarray | None = None,
         anchor_curvature: bool = True,
+        optic_model: str = "pixel",
+        optic_poly_order: int = 10,
+        optic_poly_order_x: int | None = None,
+        optic_poly_order_y: int | None = None,
+        optic_poly_basis: str = "legendre",
         device: str = "cpu",
     ):
         super().__init__()
@@ -206,6 +276,16 @@ class StitchingModel(nn.Module):
         self.plane_order = plane_order
         self.fit_tilt_per_frame = plane_order == "tilt" or fit_power_per_frame
         self.interp_mode = interp_mode
+        self.optic_model = optic_model
+        self.optic_poly_order = optic_poly_order
+        self.optic_poly_order_x = optic_poly_order_x
+        self.optic_poly_order_y = optic_poly_order_y
+        self.optic_poly_basis = optic_poly_basis
+        self.O_terms: list[tuple[int, int]] | None = None
+        if optic_model not in ("pixel", "poly"):
+            raise ValueError(f"unsupported optic_model {optic_model!r}")
+        if optic_poly_basis != "legendre":
+            raise ValueError("only --optic-poly-basis legendre is currently implemented")
         self.scan_is_1d = float(np.ptp(scan_positions[:, 0])) < 0.5
         nominal_step_px = estimate_step_px(scan_positions) if step_px is None else float(step_px)
         self.max_delta_pos = float(max(4.0, 2.0 * nominal_step_px))
@@ -248,7 +328,8 @@ class StitchingModel(nn.Module):
             warm = init
             optic_prior = np.where(prior_valid, init, 0.0)
             optic_prior_mask = prior_valid.astype(np.float64)
-        self.O = nn.Parameter(torch.as_tensor(warm, dtype=torch.float64, device=device_t))
+        self.O: nn.Parameter | None = None
+        self.O_coeff: nn.Parameter | None = None
         if optic_prior is not None and optic_prior_mask is not None:
             self.register_buffer("optic_prior", torch.as_tensor(optic_prior, dtype=torch.float64, device=device_t))
             self.register_buffer("optic_prior_mask", torch.as_tensor(optic_prior_mask, dtype=torch.float64, device=device_t))
@@ -296,6 +377,23 @@ class StitchingModel(nn.Module):
         self.register_buffer("optic_lap_valid_y", lap_valid_y)
         self.register_buffer("optic_seam_lap_weight_x", seam_lap_weight_x)
         self.register_buffer("optic_seam_lap_weight_y", seam_lap_weight_y)
+
+        if optic_model == "pixel":
+            self.O = nn.Parameter(torch.as_tensor(warm, dtype=torch.float64, device=device_t))
+        else:
+            total_degree = optic_poly_order_x is None and optic_poly_order_y is None
+            basis_np, terms = make_legendre2d_basis(
+                optic_canvas_shape,
+                order=optic_poly_order,
+                order_x=optic_poly_order_x,
+                order_y=optic_poly_order_y,
+                total_degree=total_degree,
+            )
+            coeff_np = fit_basis_coefficients(warm, basis_np, weight=binary_coverage_norm)
+            self.register_buffer("O_basis", torch.as_tensor(basis_np, dtype=torch.float64, device=device_t))
+            self.O_terms = terms
+            self.O_coeff = nn.Parameter(torch.as_tensor(coeff_np, dtype=torch.float64, device=device_t))
+
         self.S = nn.Parameter(torch.zeros((self.h, self.w), dtype=torch.float64, device=device_t)) if fit_S else None
         k = 1 + (2 if self.fit_tilt_per_frame else 0) + (1 if fit_power_per_frame else 0)
         self.power_col = k - 1 if fit_power_per_frame else None
@@ -311,7 +409,7 @@ class StitchingModel(nn.Module):
             self.register_buffer("position_gauge_design", torch.as_tensor(position_design, dtype=torch.float64, device=device_t))
         else:
             self.position_gauge_design = None
-        self.curvature_anchor_enabled = bool(anchor_curvature and initial_optic is not None)
+        self.curvature_anchor_enabled = bool(optic_model == "pixel" and anchor_curvature and initial_optic is not None)
         self._setup_curvature_anchor()
         if initial_optic is not None:
             self.initialize_planes_from_current_optic()
@@ -323,9 +421,26 @@ class StitchingModel(nn.Module):
         proj = (self.S[None] * self.S_low_bases).sum(dim=(1, 2))
         return self.S - (proj[:, None, None] * self.S_low_bases).sum(dim=0)
 
+    def current_optic_map(self) -> torch.Tensor:
+        if self.optic_model == "pixel":
+            if self.O is None:
+                raise RuntimeError("pixel optic model has no O parameter")
+            return self.O
+        if self.O_coeff is None:
+            raise RuntimeError("polynomial optic model has no coefficient parameter")
+        optic = torch.einsum("k,khw->hw", self.O_coeff, self.O_basis)
+        return optic
+
+    def optic_parameters(self) -> list[nn.Parameter]:
+        if self.optic_model == "pixel":
+            return [self.O] if self.O is not None else []
+        params = [self.O_coeff] if self.O_coeff is not None else []
+        return params
+
     def _setup_curvature_anchor(self) -> None:
-        y = torch.linspace(-1.0, 1.0, self.H, dtype=torch.float64, device=self.O.device)
-        x = torch.linspace(-1.0, 1.0, self.W, dtype=torch.float64, device=self.O.device)
+        device = self.M.device
+        y = torch.linspace(-1.0, 1.0, self.H, dtype=torch.float64, device=device)
+        x = torch.linspace(-1.0, 1.0, self.W, dtype=torch.float64, device=device)
         yy, xx = torch.meshgrid(y, x, indexing="ij")
         self.register_buffer("optic_poly_x2", xx**2)
         self.register_buffer("optic_poly_y2", yy**2)
@@ -341,11 +456,11 @@ class StitchingModel(nn.Module):
         self.register_buffer("optic_poly_design", design)
         affine_design = design[:, :3]
         affine_gram = affine_design.T @ affine_design
-        affine_gram = affine_gram + 1e-12 * torch.eye(3, dtype=torch.float64, device=self.O.device)
+        affine_gram = affine_gram + 1e-12 * torch.eye(3, dtype=torch.float64, device=device)
         self.register_buffer("optic_affine_design", affine_design)
         self.register_buffer("optic_affine_gram_inv", torch.linalg.inv(affine_gram))
         with torch.no_grad():
-            self.register_buffer("curvature_prior_coeff", self._optic_poly_coeff(self.O).detach())
+            self.register_buffer("curvature_prior_coeff", self._optic_poly_coeff(self.current_optic_map()).detach())
 
     def _optic_poly_coeff(self, image: torch.Tensor) -> torch.Tensor:
         values = image[self.optic_poly_valid].reshape(-1, 1)
@@ -354,10 +469,10 @@ class StitchingModel(nn.Module):
         return torch.linalg.lstsq(self.optic_poly_design, values).solution[:, 0]
 
     def project_curvature_to_prior(self) -> None:
-        if not self.curvature_anchor_enabled:
+        if not self.curvature_anchor_enabled or self.O is None:
             return
         with torch.no_grad():
-            coeff = self._optic_poly_coeff(self.O)
+            coeff = self._optic_poly_coeff(self.current_optic_map())
             dqxx = self.curvature_prior_coeff[3] - coeff[3]
             dqyy = self.curvature_prior_coeff[4] - coeff[4]
             self.O += dqxx * self.optic_poly_x2 + dqyy * self.optic_poly_y2
@@ -372,7 +487,8 @@ class StitchingModel(nn.Module):
 
     def _sample_optic(self, frame_idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         grid, inside = self.build_grid(frame_idx)
-        optic_in = self.O[None, None].expand(len(frame_idx), -1, -1, -1)
+        optic_map = self.current_optic_map()
+        optic_in = optic_map[None, None].expand(len(frame_idx), -1, -1, -1)
         optic_sub = F.grid_sample(
             optic_in,
             grid,
@@ -410,117 +526,13 @@ class StitchingModel(nn.Module):
                 coeff = torch.linalg.lstsq(design, residual[valid].reshape(-1, 1)).solution[:, 0]
                 self.planes[frame, : coeff.numel()] = coeff
 
-    def project_systematic_gauge(self) -> None:
-        if not self.fit_S or self.S is None:
-            return
-        with torch.no_grad():
-            proj = (self.S[None] * self.S_low_bases).sum(dim=(1, 2))
-            self.S -= (proj[:, None, None] * self.S_low_bases).sum(dim=0)
-
-    def update_optic_from_current_terms(self) -> dict[str, float]:
-        """Closed-form optic update using the same subpixel geometry as ADP."""
-
-        if not self.fit_S or self.S is None:
-            return {}
-        previous = self.O.detach().clone()
-        numerator = torch.zeros_like(self.O)
-        denominator = torch.zeros_like(self.O)
-        with torch.no_grad():
-            pos = self.current_positions()
-            s_eff = self.S_effective
-            s_term = s_eff if s_eff is not None else torch.zeros_like(self.S)
-            for frame in range(self.N):
-                py = float(pos[frame, 0].detach().cpu().item())
-                px = float(pos[frame, 1].detach().cpu().item())
-                y0 = int(np.floor(py))
-                x0 = int(np.floor(px))
-                fy = py - y0
-                fx = px - x0
-                plane = self._plane_from_coeffs(self.planes[frame : frame + 1]).squeeze(0)
-                residual = (self.M[frame] - s_term - plane) * self.mask[frame]
-                mask = self.mask[frame]
-                weights = [
-                    ((1.0 - fy) * (1.0 - fx), 0, 0),
-                    ((1.0 - fy) * fx, 0, 1),
-                    (fy * (1.0 - fx), 1, 0),
-                    (fy * fx, 1, 1),
-                ]
-                for weight, dy, dx in weights:
-                    if weight == 0.0:
-                        continue
-                    ys0 = y0 + dy
-                    xs0 = x0 + dx
-                    ys1 = ys0 + self.h
-                    xs1 = xs0 + self.w
-                    ya = max(0, ys0)
-                    yb = min(self.H, ys1)
-                    xa = max(0, xs0)
-                    xb = min(self.W, xs1)
-                    if yb <= ya or xb <= xa:
-                        continue
-                    sy0 = ya - ys0
-                    sx0 = xa - xs0
-                    sy1 = sy0 + (yb - ya)
-                    sx1 = sx0 + (xb - xa)
-                    numerator[ya:yb, xa:xb] += weight * residual[sy0:sy1, sx0:sx1]
-                    denominator[ya:yb, xa:xb] += weight * mask[sy0:sy1, sx0:sx1]
-            valid_t = denominator > 1e-8
-            self.O[valid_t] = numerator[valid_t] / denominator[valid_t]
-            delta = self.O - previous
-            if bool(valid_t.any()):
-                vals = delta[valid_t]
-                return {
-                    "optic_update_rms_nm": float(torch.sqrt((vals**2).mean()).cpu().item()),
-                    "optic_update_pv_nm": float((vals.max() - vals.min()).cpu().item()),
-                }
-        return {"optic_update_rms_nm": 0.0, "optic_update_pv_nm": 0.0}
-
     def refresh_optic_priors(self) -> None:
         with torch.no_grad():
+            optic_map = self.current_optic_map().detach()
             if self.optic_prior is not None and self.optic_prior_mask is not None:
-                self.optic_prior.copy_(torch.where(self.optic_prior_mask > 0, self.O.detach(), self.optic_prior))
+                self.optic_prior.copy_(torch.where(self.optic_prior_mask > 0, optic_map, self.optic_prior))
             if self.curvature_anchor_enabled:
-                self.curvature_prior_coeff.copy_(self._optic_poly_coeff(self.O).detach())
-
-    def initialize_systematic_from_current_residual(self, frame_batch_size: int) -> dict[str, float]:
-        if not self.fit_S or self.S is None:
-            return {}
-        with torch.no_grad():
-            numerator = torch.zeros_like(self.S)
-            denominator = torch.zeros_like(self.S)
-            before_sum = torch.zeros((), dtype=torch.float64, device=self.M.device)
-            before_count = torch.zeros((), dtype=torch.float64, device=self.M.device)
-            for start in range(0, self.N, frame_batch_size):
-                idx = torch.arange(start, min(self.N, start + frame_batch_size), device=self.M.device)
-                optic_sub, inside = self._sample_optic(idx)
-                plane = self._plane_from_coeffs(self.planes[idx])
-                mask = self.mask[idx] * inside
-                residual = (self.M[idx] - optic_sub - plane) * mask
-                numerator += residual.sum(dim=0)
-                denominator += mask.sum(dim=0)
-                before_sum += (residual**2).sum()
-                before_count += mask.sum()
-            estimate = torch.where(denominator > 0, numerator / denominator.clamp_min(1.0), torch.zeros_like(numerator))
-            self.S.copy_(estimate)
-            after_sum = torch.zeros((), dtype=torch.float64, device=self.M.device)
-            after_count = torch.zeros((), dtype=torch.float64, device=self.M.device)
-            for start in range(0, self.N, frame_batch_size):
-                idx = torch.arange(start, min(self.N, start + frame_batch_size), device=self.M.device)
-                optic_sub, inside = self._sample_optic(idx)
-                plane = self._plane_from_coeffs(self.planes[idx])
-                mask = self.mask[idx] * inside
-                s_eff = self.S_effective
-                residual = (self.M[idx] - optic_sub - plane - (s_eff[None] if s_eff is not None else 0.0)) * mask
-                after_sum += (residual**2).sum()
-                after_count += mask.sum()
-            s_eff = self.S_effective
-            s_stats = s_eff if s_eff is not None else self.S
-            return {
-                "systematic_init_before_rms_nm": float(torch.sqrt(before_sum / before_count.clamp_min(1.0)).cpu().item()),
-                "systematic_init_after_rms_nm": float(torch.sqrt(after_sum / after_count.clamp_min(1.0)).cpu().item()),
-                "systematic_init_rms_nm": float(torch.sqrt((s_stats**2).mean()).cpu().item()),
-                "systematic_init_pv_nm": float((s_stats.max() - s_stats.min()).cpu().item()),
-            }
+                self.curvature_prior_coeff.copy_(self._optic_poly_coeff(optic_map).detach())
 
     def project_position_gauge(self) -> None:
         """Remove unobservable position gauges from the refinement parameters.
@@ -594,14 +606,16 @@ class StitchingModel(nn.Module):
         too small while preserving a good residual.
         """
 
+        if self.optic_model != "pixel" or self.O is None:
+            return
         with torch.no_grad():
             mean_piston = self.planes[:, 0].mean()
-            mean_tilt_u = self.planes[:, 1].mean() if self.fit_tilt_per_frame else torch.zeros((), dtype=torch.float64, device=self.O.device)
-            mean_tilt_v = self.planes[:, 2].mean() if self.fit_tilt_per_frame else torch.zeros((), dtype=torch.float64, device=self.O.device)
+            mean_tilt_u = self.planes[:, 1].mean() if self.fit_tilt_per_frame else torch.zeros((), dtype=torch.float64, device=self.M.device)
+            mean_tilt_v = self.planes[:, 2].mean() if self.fit_tilt_per_frame else torch.zeros((), dtype=torch.float64, device=self.M.device)
             mean_power = self.planes[:, self.power_col].mean() if self.fit_power_per_frame and self.power_col is not None else None
 
-            y = torch.arange(self.H, dtype=torch.float64, device=self.O.device)
-            x = torch.arange(self.W, dtype=torch.float64, device=self.O.device)
+            y = torch.arange(self.H, dtype=torch.float64, device=self.M.device)
+            x = torch.arange(self.W, dtype=torch.float64, device=self.M.device)
             yy, xx = torch.meshgrid(y, x, indexing="ij")
             x_norm = 2.0 * xx / (self.W - 1) - 1.0
             y_norm = 2.0 * yy / (self.H - 1) - 1.0
@@ -655,8 +669,11 @@ def batched_loss(
     optic_prior_l2: float,
     position_l2: float,
     curv_anchor_l2: float,
+    optic_coeff_l2: float,
+    optic_coeff_degree_power: float,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     device = model.M.device
+    optic_map = model.current_optic_map()
     loss_sum = torch.zeros((), dtype=torch.float64, device=device)
     valid_sum = torch.zeros((), dtype=torch.float64, device=device)
     for start in range(0, model.N, frame_batch_size):
@@ -669,7 +686,7 @@ def batched_loss(
 
     observed = model.optic_observed_mask
     loss_univ_gauge = (
-        ((model.O * observed).sum() / observed.sum().clamp_min(1.0)) ** 2
+        ((optic_map * observed).sum() / observed.sum().clamp_min(1.0)) ** 2
         + model.planes[:, 0].mean() ** 2
     )
     if model.fit_tilt_per_frame:
@@ -678,11 +695,11 @@ def batched_loss(
         loss_univ_gauge = loss_univ_gauge + model.planes[:, model.power_col].mean() ** 2
 
     if model.scan_is_1d:
-        y = torch.linspace(-1.0, 1.0, model.O.shape[0], dtype=torch.float64, device=device)
+        y = torch.linspace(-1.0, 1.0, optic_map.shape[0], dtype=torch.float64, device=device)
         y_map = y[:, None]
         cov = observed
-        cy = (model.O * cov * y_map).sum() / (cov * y_map**2).sum().clamp_min(1.0)
-        cy2 = (model.O * cov * y_map**2).sum() / (cov * y_map**4).sum().clamp_min(1.0)
+        cy = (optic_map * cov * y_map).sum() / (cov * y_map**2).sum().clamp_min(1.0)
+        cy2 = (optic_map * cov * y_map**2).sum() / (cov * y_map**4).sum().clamp_min(1.0)
         loss_univ_gauge = loss_univ_gauge + 1e3 * (cy**2 + cy2**2)
 
     loss_S_gauge = torch.zeros((), dtype=torch.float64, device=device)
@@ -700,7 +717,7 @@ def batched_loss(
     if optic_prior_l2 > 0 and model.optic_prior is not None and model.optic_prior_mask is not None:
         prior_valid = model.optic_prior_mask[model.optic_poly_valid] > 0
         if bool(prior_valid.any()):
-            prior_values = (model.O - model.optic_prior)[model.optic_poly_valid][prior_valid]
+            prior_values = (optic_map - model.optic_prior)[model.optic_poly_valid][prior_valid]
             design_affine = model.optic_affine_design[prior_valid]
             if prior_values.numel() >= 3:
                 gram = design_affine.T @ design_affine
@@ -716,16 +733,16 @@ def batched_loss(
 
     raw_smooth = torch.zeros((), dtype=torch.float64, device=device)
     if smoothness > 0:
-        d2x = model.O[:, 2:] - 2.0 * model.O[:, 1:-1] + model.O[:, :-2]
-        d2y = model.O[2:, :] - 2.0 * model.O[1:-1, :] + model.O[:-2, :]
+        d2x = optic_map[:, 2:] - 2.0 * optic_map[:, 1:-1] + optic_map[:, :-2]
+        d2y = optic_map[2:, :] - 2.0 * optic_map[1:-1, :] + optic_map[:-2, :]
         raw_smooth = (d2x**2 * model.optic_lap_valid_x).sum() / model.optic_lap_valid_x.sum().clamp_min(1.0)
         raw_smooth = raw_smooth + (d2y**2 * model.optic_lap_valid_y).sum() / model.optic_lap_valid_y.sum().clamp_min(1.0)
     loss_smooth = smoothness * raw_smooth
 
     raw_seam_smooth = torch.zeros((), dtype=torch.float64, device=device)
     if seam_smoothness > 0:
-        d2x = model.O[:, 2:] - 2.0 * model.O[:, 1:-1] + model.O[:, :-2]
-        d2y = model.O[2:, :] - 2.0 * model.O[1:-1, :] + model.O[:-2, :]
+        d2x = optic_map[:, 2:] - 2.0 * optic_map[:, 1:-1] + optic_map[:, :-2]
+        d2y = optic_map[2:, :] - 2.0 * optic_map[1:-1, :] + optic_map[:-2, :]
         raw_seam_smooth = (d2x**2 * model.optic_seam_lap_weight_x).sum() / (model.optic_seam_lap_weight_x > 0).to(torch.float64).sum().clamp_min(1.0)
         raw_seam_smooth = raw_seam_smooth + (d2y**2 * model.optic_seam_lap_weight_y).sum() / (model.optic_seam_lap_weight_y > 0).to(torch.float64).sum().clamp_min(1.0)
     loss_seam_smooth = seam_smoothness * raw_seam_smooth
@@ -744,9 +761,15 @@ def batched_loss(
 
     loss_curv_anchor = torch.zeros((), dtype=torch.float64, device=device)
     if curv_anchor_l2 > 0 and model.curvature_anchor_enabled:
-        coeff = model._optic_poly_coeff(model.O)
+        coeff = model._optic_poly_coeff(optic_map)
         dq = coeff[3:5] - model.curvature_prior_coeff[3:5]
         loss_curv_anchor = curv_anchor_l2 * (dq**2).sum()
+
+    loss_optic_coeff = torch.zeros((), dtype=torch.float64, device=device)
+    if model.optic_model != "pixel" and optic_coeff_l2 > 0 and model.O_coeff is not None and model.O_terms is not None:
+        degrees = torch.as_tensor([ix + iy for ix, iy in model.O_terms], dtype=torch.float64, device=device)
+        weights = (1.0 + degrees) ** optic_coeff_degree_power
+        loss_optic_coeff = optic_coeff_l2 * (weights * model.O_coeff**2).mean()
 
     weighted_univ_gauge = lam_g * loss_univ_gauge
     weighted_S_gauge = lam_s * loss_S_gauge
@@ -761,6 +784,7 @@ def batched_loss(
         + loss_seam_smooth
         + loss_s_prior
         + loss_curv_anchor
+        + loss_optic_coeff
     )
     components = {
         "total": total.detach(),
@@ -774,6 +798,7 @@ def batched_loss(
         "seam_smoothness": loss_seam_smooth.detach(),
         "s_prior": loss_s_prior.detach(),
         "curv_anchor": loss_curv_anchor.detach(),
+        "optic_coeff": loss_optic_coeff.detach(),
         "raw_univ_gauge": loss_univ_gauge.detach(),
         "raw_S_gauge": loss_S_gauge.detach(),
         "raw_smoothness": raw_smooth.detach(),
@@ -787,38 +812,35 @@ def reconstruct_stitching(
     scan_positions: np.ndarray,
     *,
     optic_canvas_shape: tuple[int, int] | None = None,
-    S_known: np.ndarray | None = None,
-    fit_S: bool = False,
     fit_positions: bool = False,
-    fit_power_per_frame: bool = False,
     plane_order: str = "tilt",
     interp_mode: str = "bilinear",
-    aperture_feather: int = 4,
+    optic_model: str = "pixel",
+    optic_poly_order: int = 10,
+    optic_poly_order_x: int | None = None,
+    optic_poly_order_y: int | None = None,
+    optic_poly_basis: str = "legendre",
     min_output_coverage: float = 0.15,
     smoothness: float = 0.0,
     seam_smoothness: float = 0.0,
     plane_l2: float = 0.0,
-    s_l2: float = 0.0,
-    s_smoothness: float = 0.0,
     frame_batch_size: int = 16,
     device: str = "cpu",
-    phase1_iters: int = 100,
     phase2_iters: int = 500,
-    phase3_iters: int = 0,
     step_px: float | None = None,
     initial_optic: np.ndarray | None = None,
     anchor_curvature: bool = True,
-    s_init: str = "mean",
-    s_init_iters: int = 3,
+    s_mode: str = "fixed_from_residual",
+    s_highpass_order: int = 3,
     optic_prior_l2: float = 0.005,
     position_l2: float = 1.0,
     curv_anchor_l2: float = 100.0,
+    optic_coeff_l2: float = 0.0,
+    optic_coeff_degree_power: float = 4.0,
     lam_g: float = 1e-6,
-    lam_s: float = 1.0,
     accept_tol: float = 1.05,
     rollback_factor: float = 1.5,
     lr_o: float = 1e-1,
-    lr_s: float = 5e-3,
     lr_planes: float = 1e-2,
     lr_pos: float = 1e-3,
     verbose: bool = True,
@@ -830,18 +852,27 @@ def reconstruct_stitching(
         print(f"scan geometry kappa={kappa:.3g}, weak_dir={weak_dir}")
         print(f"canvas shape={canvas_shape}, frames={measurements.shape[0]}, frame shape={frame_shape}")
 
+    fit_S_effective = False
+    if s_mode not in ("fixed_from_residual", "none"):
+        raise ValueError(f"unsupported s_mode {s_mode!r}")
+
     model = StitchingModel(
         measurements,
         masks,
         scan_positions,
         canvas_shape,
-        S_known=S_known,
-        fit_S=fit_S,
+        S_known=None,
+        fit_S=False,
         fit_positions=fit_positions,
-        fit_power_per_frame=fit_power_per_frame,
+        fit_power_per_frame=False,
         plane_order=plane_order,
         interp_mode=interp_mode,
-        aperture_feather=aperture_feather,
+        optic_model=optic_model,
+        optic_poly_order=optic_poly_order,
+        optic_poly_order_x=optic_poly_order_x,
+        optic_poly_order_y=optic_poly_order_y,
+        optic_poly_basis=optic_poly_basis,
+        aperture_feather=0,
         min_output_coverage=min_output_coverage,
         step_px=step_px,
         initial_optic=initial_optic,
@@ -850,7 +881,7 @@ def reconstruct_stitching(
     )
 
     history: list[dict[str, Any]] = []
-    systematic_init_summary: dict[str, float] | None = None
+    fixed_systematic_summary: dict[str, Any] | None = None
 
     def log(
         phase: str,
@@ -895,6 +926,8 @@ def reconstruct_stitching(
             optic_prior_l2=0.0,
             position_l2=0.0,
             curv_anchor_l2=0.0,
+            optic_coeff_l2=0.0,
+            optic_coeff_degree_power=optic_coeff_degree_power,
         )
         return loss_data.detach()
 
@@ -903,20 +936,23 @@ def reconstruct_stitching(
             model,
             frame_batch_size,
             lam_g=lam_g,
-            lam_s=lam_s if fit_S else 0.0,
+            lam_s=0.0,
             smoothness=use_smoothness,
             seam_smoothness=seam_smoothness,
             plane_l2=plane_l2,
-            s_l2=s_l2,
-            s_smoothness=s_smoothness,
+            s_l2=0.0,
+            s_smoothness=0.0,
             optic_prior_l2=optic_prior_l2,
             position_l2=position_l2,
             curv_anchor_l2=curv_anchor_l2 if model.curvature_anchor_enabled else 0.0,
+            optic_coeff_l2=optic_coeff_l2,
+            optic_coeff_degree_power=optic_coeff_degree_power,
         )
 
     def snapshot_state() -> dict[str, torch.Tensor | None]:
         return {
-            "O": model.O.detach().clone(),
+            "O": model.O.detach().clone() if model.O is not None else None,
+            "O_coeff": model.O_coeff.detach().clone() if model.O_coeff is not None else None,
             "planes": model.planes.detach().clone(),
             "S": model.S.detach().clone() if model.S is not None else None,
             "delta_pos": model.delta_pos.detach().clone() if model.delta_pos is not None else None,
@@ -924,7 +960,10 @@ def reconstruct_stitching(
 
     def restore_state(state: dict[str, torch.Tensor | None]) -> None:
         with torch.no_grad():
-            model.O.copy_(state["O"])
+            if model.O is not None and state["O"] is not None:
+                model.O.copy_(state["O"])
+            if model.O_coeff is not None and state["O_coeff"] is not None:
+                model.O_coeff.copy_(state["O_coeff"])
             model.planes.copy_(state["planes"])
             if model.S is not None and state["S"] is not None:
                 model.S.copy_(state["S"])
@@ -963,75 +1002,33 @@ def reconstruct_stitching(
         optic_prior_l2=0.0,
         position_l2=0.0,
         curv_anchor_l2=0.0,
+        optic_coeff_l2=0.0,
+        optic_coeff_degree_power=optic_coeff_degree_power,
     )
     log("initial", 0, initial_loss_data, components=initial_components)
 
-    if fit_S and s_init != "none":
-        init_records = []
-        for init_step in range(max(1, s_init_iters)):
-            systematic_init_summary = model.initialize_systematic_from_current_residual(frame_batch_size)
-            model.initialize_planes_from_current_optic()
-            before_o_update_loss, before_o_update_data, _ = optimization_loss(0.0)
-            before_o_update_state = snapshot_state()
-            optic_update_summary = model.update_optic_from_current_terms()
-            model.initialize_planes_from_current_optic()
-            after_o_update_loss, after_o_update_data, _ = optimization_loss(0.0)
-            data_ok = float(after_o_update_data.detach().cpu().item()) <= float(before_o_update_data.detach().cpu().item()) * accept_tol
-            total_ok = float(after_o_update_loss.detach().cpu().item()) <= float(before_o_update_loss.detach().cpu().item()) * accept_tol
-            if data_ok and total_ok:
-                o_update_accepted = True
-                s_init_loss_data = after_o_update_data.detach()
-            else:
-                restore_state(before_o_update_state)
-                o_update_accepted = False
-                optic_update_summary = {key: 0.0 for key in optic_update_summary}
-                s_init_loss_data = before_o_update_data.detach()
-            init_records.append({
-                "iteration": init_step + 1,
-                **systematic_init_summary,
-                **optic_update_summary,
-                "optic_update_accepted": o_update_accepted,
-                "after_coordinate_update_rms_nm": float(torch.sqrt(s_init_loss_data).cpu().item()),
-            })
-            log("s_init", init_step + 1, s_init_loss_data, accepted=o_update_accepted)
-        systematic_init_summary = {"iterations": init_records}
-        model.refresh_optic_priors()
+    if s_mode == "fixed_from_residual":
+        model.initialize_planes_from_current_optic()
+        fixed_s, fixed_systematic_summary = estimate_detector_systematic_from_residual(
+            model,
+            frame_batch_size,
+            highpass_order=s_highpass_order,
+        )
+        model.S_fixed = torch.as_tensor(fixed_s, dtype=torch.float64, device=model.M.device)
+        model.initialize_planes_from_current_optic()
 
     best_loss, best_loss_data, best_components = optimization_loss(0.0)
     best_loss = best_loss.detach()
     best_state = snapshot_state()
-
-    # Phase 1: planes and S only, O frozen.
-    model.O.requires_grad_(False)
-    params = [{"params": [model.planes], "lr": lr_planes}]
-    if fit_S:
-        params.append({"params": [model.S], "lr": lr_s})
-    opt = torch.optim.Adam(params)
-    best_opt_state = copy.deepcopy(opt.state_dict())
-    for step in range(max(0, phase1_iters)):
-        opt.zero_grad(set_to_none=True)
-        loss, loss_data, components = optimization_loss(0.0)
-        loss.backward()
-        opt.step()
-        candidate_loss, candidate_loss_data, candidate_components = optimization_loss(0.0)
-        best_loss, best_state, best_opt_state, accepted, status = accept_or_restore(
-            candidate_loss.detach(), best_loss, best_state, opt, best_opt_state
-        )
-        if step == 0 or (step + 1) % 50 == 0 or step == phase1_iters - 1:
-            log("phase1", step + 1, candidate_loss_data.detach(), components=candidate_components, accepted=accepted, status=status)
-
-    restore_state(best_state)
-    model.project_mean_plane_to_optic()
 
     # Phase 2: joint Adam.
     model.project_mean_plane_to_optic()
     best_loss, best_loss_data, best_components = optimization_loss(smoothness)
     best_loss = best_loss.detach()
     best_state = snapshot_state()
-    model.O.requires_grad_(True)
-    params = [{"params": [model.O], "lr": lr_o}, {"params": [model.planes], "lr": lr_planes}]
-    if fit_S:
-        params.append({"params": [model.S], "lr": lr_s})
+    for param in model.optic_parameters():
+        param.requires_grad_(True)
+    params = [{"params": model.optic_parameters(), "lr": lr_o}, {"params": [model.planes], "lr": lr_planes}]
     if fit_positions:
         params.append({"params": [model.delta_pos], "lr": lr_pos})
     opt = torch.optim.Adam(params)
@@ -1052,48 +1049,22 @@ def reconstruct_stitching(
             log("phase2", step + 1, candidate_loss_data.detach(), components=candidate_components, accepted=accepted, status=status)
 
     restore_state(best_state)
-    if fit_positions and model.delta_pos is not None:
-        model.delta_pos.requires_grad_(False)
-    phase3_skipped_reason = None
-    if phase3_iters > 0:
-        lbfgs_params = [model.O, model.planes]
-        if fit_S and model.S is not None:
-            lbfgs_params.append(model.S)
-        opt = torch.optim.LBFGS(
-            lbfgs_params,
-            lr=1.0,
-            max_iter=20,
-            history_size=20,
-            line_search_fn="strong_wolfe",
-        )
-
-        last_loss_data = torch.zeros((), dtype=torch.float64, device=model.M.device)
-
-        def closure() -> torch.Tensor:
-            nonlocal last_loss_data
-            opt.zero_grad(set_to_none=True)
-            loss, loss_data, components = optimization_loss(smoothness)
-            loss.backward()
-            last_loss_data = loss_data.detach()
-            return loss
-
-        for step in range(phase3_iters):
-            opt.step(closure)
-            model.project_position_gauge()
-            if step == 0 or (step + 1) % 5 == 0 or step == phase3_iters - 1:
-                final_loss, final_loss_data, final_components = optimization_loss(smoothness)
-                log("phase3", step + 1, final_loss_data.detach(), components=final_components)
-
     model.project_mean_plane_to_optic()
     model.project_position_gauge()
-    final_curvature_coeff = model._optic_poly_coeff(model.O).detach()
+    final_optic_map = model.current_optic_map()
+    final_curvature_coeff = model._optic_poly_coeff(final_optic_map).detach()
     residuals, reconstructed = evaluate_model(model, frame_batch_size)
-    optic = model.O.detach().cpu().numpy().astype(np.float64)
+    optic = final_optic_map.detach().cpu().numpy().astype(np.float64)
     observed = model.optic_observed_mask.detach().cpu().numpy().astype(np.float64)
     quality = model.optic_quality_mask.detach().cpu().numpy().astype(np.float64)
     optic[quality <= min_output_coverage] = np.nan
     s_eff = model.S_effective
-    systematic = s_eff.detach().cpu().numpy().astype(np.float64) if fit_S and s_eff is not None else None
+    if fit_S_effective and s_eff is not None:
+        systematic = s_eff.detach().cpu().numpy().astype(np.float64)
+    elif model.S_fixed is not None and s_mode == "fixed_from_residual":
+        systematic = model.S_fixed.detach().cpu().numpy().astype(np.float64)
+    else:
+        systematic = None
     planes = model.planes.detach().cpu().numpy().astype(np.float64)
     positions = model.current_positions().detach().cpu().numpy().astype(np.float64)
     summary = {
@@ -1103,40 +1074,86 @@ def reconstruct_stitching(
         "scan_kappa": kappa,
         "scan_is_1d": model.scan_is_1d,
         "max_delta_pos": model.max_delta_pos,
-        "phase3_iters": phase3_iters,
-        "phase3_skipped_reason": phase3_skipped_reason,
-        "fit_S": fit_S,
-        "s_init": s_init if fit_S else None,
-        "s_init_iters": s_init_iters if fit_S else 0,
-        "systematic_init_summary": systematic_init_summary,
+        "fit_S": False,
+        "s_mode": s_mode,
+        "s_highpass_order": s_highpass_order,
+        "systematic_init_summary": None,
+        "fixed_systematic_summary": fixed_systematic_summary,
         "fit_positions": fit_positions,
-        "fit_power_per_frame": fit_power_per_frame,
+        "fit_power_per_frame": False,
         "plane_order": plane_order,
         "initial_optic": "sequential" if initial_optic is not None else "warm_average",
-        "curvature_anchor": bool(anchor_curvature and initial_optic is not None),
+        "optic_model": model.optic_model,
+        "optic_poly_order": optic_poly_order,
+        "optic_poly_order_x": optic_poly_order_x,
+        "optic_poly_order_y": optic_poly_order_y,
+        "optic_poly_basis": optic_poly_basis,
+        "optic_poly_terms": [list(term) for term in model.O_terms] if model.O_terms is not None else None,
+        "optic_poly_coefficients": model.O_coeff.detach().cpu().numpy().tolist() if model.O_coeff is not None else None,
+        "curvature_anchor": bool(model.curvature_anchor_enabled),
         "curvature_anchor_coeff_normalized": model.curvature_prior_coeff.detach().cpu().numpy().tolist() if model.curvature_anchor_enabled else None,
         "curvature_final_coeff_normalized": final_curvature_coeff.cpu().numpy().tolist(),
         "curvature_anchor_delta_normalized": (final_curvature_coeff - model.curvature_prior_coeff).cpu().numpy().tolist() if model.curvature_anchor_enabled else None,
         "optic_prior_l2": optic_prior_l2,
         "position_l2": position_l2,
         "curv_anchor_l2": curv_anchor_l2,
+        "optic_coeff_l2": optic_coeff_l2,
+        "optic_coeff_degree_power": optic_coeff_degree_power,
         "lam_g": lam_g,
-        "lam_s": lam_s if fit_S else 0.0,
         "accept_tol": accept_tol,
         "rollback_factor": rollback_factor,
         "position_gauge": "1d_zero_y_and_remove_x_affine" if model.scan_is_1d and fit_positions else ("remove_mean_xy" if fit_positions else None),
         "position_delta_rms_px": float(np.sqrt(np.mean((positions - scan_positions) ** 2))) if fit_positions else 0.0,
         "position_delta_pv_px": finite_pv(positions - scan_positions) if fit_positions else 0.0,
         "interp_mode": interp_mode,
-        "aperture_feather": aperture_feather,
+        "aperture_feather": 0,
         "min_output_coverage": min_output_coverage,
         "plane_l2": plane_l2,
         "smoothness": smoothness,
         "seam_smoothness": seam_smoothness,
-        "s_l2": s_l2,
-        "s_smoothness": s_smoothness,
     }
     return StitchingResult(optic, systematic, planes, positions, residuals, reconstructed, observed, quality, history, summary)
+
+
+def estimate_detector_systematic_from_residual(
+    model: StitchingModel,
+    frame_batch_size: int,
+    *,
+    highpass_order: int = 3,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    residual_stack = []
+    with torch.no_grad():
+        for start in range(0, model.N, frame_batch_size):
+            idx = torch.arange(start, min(model.N, start + frame_batch_size), device=model.M.device)
+            pred, mask, frame_idx = model.forward_batch(idx)
+            res = model.M[frame_idx] - pred
+            res_np = res.detach().cpu().numpy()
+            mask_np = mask.detach().cpu().numpy() > 0
+            res_np[~mask_np] = np.nan
+            residual_stack.append(res_np)
+    residual_stack_np = np.concatenate(residual_stack, axis=0)
+    finite_count = np.isfinite(residual_stack_np).sum(axis=0)
+    systematic = np.zeros(residual_stack_np.shape[1:], dtype=np.float64)
+    valid_any = finite_count > 0
+    with np.errstate(invalid="ignore"):
+        systematic[valid_any] = np.nanmedian(residual_stack_np[:, valid_any], axis=0)
+    valid = np.isfinite(systematic)
+    systematic_hp, coeff, terms = remove_low_order_legendre(
+        systematic,
+        order=highpass_order,
+        weight=valid.astype(np.float64),
+    )
+    systematic_hp[~valid] = 0.0
+    summary = {
+        "method": "median detector-coordinate residual, with low-order Legendre detector modes removed",
+        "highpass_order": highpass_order,
+        "low_order_terms": [list(term) for term in terms],
+        "low_order_coefficients": coeff.tolist(),
+        "systematic_rms_nm": finite_rms(systematic_hp),
+        "systematic_pv_nm": finite_pv(systematic_hp),
+        "valid_pixels": int(np.count_nonzero(valid)),
+    }
+    return systematic_hp.astype(np.float64), summary
 
 
 def evaluate_model(model: StitchingModel, frame_batch_size: int) -> tuple[np.ndarray, np.ndarray]:
@@ -1226,10 +1243,82 @@ def pixel_spacing_from_data(data: dict[str, Any]) -> tuple[float, float] | None:
     return sy * downsample, sx * downsample
 
 
+def profile_axis_nanmedian(image: np.ndarray, axis: int) -> np.ndarray:
+    """Median height profile while keeping all-NaN rows/columns as NaN."""
+
+    arr = np.asarray(image, dtype=np.float64)
+    out_len = arr.shape[1] if axis == 0 else arr.shape[0]
+    profile = np.full(out_len, np.nan, dtype=np.float64)
+    if axis == 0:
+        for idx in range(arr.shape[1]):
+            vals = arr[:, idx]
+            vals = vals[np.isfinite(vals)]
+            if vals.size:
+                profile[idx] = float(np.median(vals))
+    elif axis == 1:
+        for idx in range(arr.shape[0]):
+            vals = arr[idx, :]
+            vals = vals[np.isfinite(vals)]
+            if vals.size:
+                profile[idx] = float(np.median(vals))
+    else:
+        raise ValueError("axis must be 0 or 1")
+    return profile
+
+
+def map_axes_mm(shape: tuple[int, int], pixel_spacing: tuple[float, float] | None) -> tuple[np.ndarray, np.ndarray]:
+    sy_mm, sx_mm = pixel_spacing if pixel_spacing is not None else (1.0, 1.0)
+    y_mm = (np.arange(shape[0], dtype=np.float64) - 0.5 * (shape[0] - 1)) * sy_mm
+    x_mm = (np.arange(shape[1], dtype=np.float64) - 0.5 * (shape[1] - 1)) * sx_mm
+    return y_mm, x_mm
+
+
+def add_second_order_npz_outputs(
+    output_arrays: dict[str, Any],
+    prefix: str,
+    raw_height: np.ndarray,
+    fitted_height: np.ndarray,
+    residual_height: np.ndarray,
+    fit_summary: dict[str, Any],
+    pixel_spacing: tuple[float, float] | None,
+) -> None:
+    """Store raw/fitted/residual maps, 1-D profiles, coefficients, and radii."""
+
+    y_mm, x_mm = map_axes_mm(raw_height.shape, pixel_spacing)
+    output_arrays[f"{prefix}_raw_height_nm"] = raw_height
+    output_arrays[f"{prefix}_second_order_fit_height_nm"] = fitted_height
+    output_arrays[f"{prefix}_second_order_residual_height_nm"] = residual_height
+    output_arrays[f"{prefix}_profile_x_mm"] = x_mm
+    output_arrays[f"{prefix}_profile_y_mm"] = y_mm
+    output_arrays[f"{prefix}_raw_profile_x_nm"] = profile_axis_nanmedian(raw_height, axis=0)
+    output_arrays[f"{prefix}_raw_profile_y_nm"] = profile_axis_nanmedian(raw_height, axis=1)
+    output_arrays[f"{prefix}_fit_profile_x_nm"] = profile_axis_nanmedian(fitted_height, axis=0)
+    output_arrays[f"{prefix}_fit_profile_y_nm"] = profile_axis_nanmedian(fitted_height, axis=1)
+    output_arrays[f"{prefix}_residual_profile_x_nm"] = profile_axis_nanmedian(residual_height, axis=0)
+    output_arrays[f"{prefix}_residual_profile_y_nm"] = profile_axis_nanmedian(residual_height, axis=1)
+    output_arrays[f"{prefix}_second_order_coefficients"] = np.asarray(fit_summary.get("coefficients", []), dtype=np.float64)
+    output_arrays[f"{prefix}_second_order_coeff_names"] = np.asarray(fit_summary.get("coeff_names", []), dtype=object)
+    output_arrays[f"{prefix}_radius_m"] = np.asarray(
+        [fit_summary.get("radius_x_m", np.nan), fit_summary.get("radius_y_m", np.nan)],
+        dtype=np.float64,
+    )
+    output_arrays[f"{prefix}_radius_names"] = np.asarray(["Rx_m", "Ry_m"], dtype=object)
+    output_arrays[f"{prefix}_principal_radius_m"] = np.asarray(fit_summary.get("principal_radius_m", []), dtype=np.float64)
+    output_arrays[f"{prefix}_principal_q_nm_per_mm2"] = np.asarray(fit_summary.get("principal_q_nm_per_mm2", []), dtype=np.float64)
+    output_arrays[f"{prefix}_principal_axis_vectors_xy"] = np.asarray(fit_summary.get("principal_axis_vectors_xy", []), dtype=np.float64)
+    output_arrays[f"{prefix}_principal_axis_angles_deg_from_x"] = np.asarray(fit_summary.get("principal_axis_angles_deg_from_x", []), dtype=np.float64)
+    output_arrays[f"{prefix}_quadratic_matrix_nm_per_mm2"] = np.asarray(fit_summary.get("quadratic_matrix_nm_per_mm2", []), dtype=np.float64)
+    output_arrays[f"{prefix}_second_order_residual_rms_nm"] = np.asarray(fit_summary.get("residual_rms_nm", np.nan), dtype=np.float64)
+    output_arrays[f"{prefix}_second_order_residual_pv_nm"] = np.asarray(fit_summary.get("residual_pv_nm", np.nan), dtype=np.float64)
+    output_arrays[f"{prefix}_second_order_summary_json"] = np.asarray(json.dumps(fit_summary), dtype=object)
+
+
 def fit_second_order_surface(
     optic: np.ndarray,
     observed_mask: np.ndarray,
     pixel_spacing: tuple[float, float] | None,
+    *,
+    include_twist: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     h, w = optic.shape
     sy_mm, sx_mm = pixel_spacing if pixel_spacing is not None else (1.0, 1.0)
@@ -1242,33 +1331,64 @@ def fit_second_order_surface(
         residual = np.full_like(optic, np.nan, dtype=np.float64)
         return fitted, residual, {"valid_pixels": int(np.count_nonzero(valid)), "error": "not enough valid pixels"}
 
-    design = np.column_stack([
-        np.ones(np.count_nonzero(valid), dtype=np.float64),
-        xx[valid],
-        yy[valid],
-        xx[valid] ** 2,
-        yy[valid] ** 2,
-    ])
-    coeff, *_ = np.linalg.lstsq(design, optic[valid], rcond=None)
-    full_design = np.stack([np.ones_like(xx), xx, yy, xx**2, yy**2], axis=0)
+    if include_twist:
+        design = np.column_stack([
+            np.ones(np.count_nonzero(valid), dtype=np.float64),
+            xx[valid],
+            yy[valid],
+            xx[valid] ** 2,
+            xx[valid] * yy[valid],
+            yy[valid] ** 2,
+        ])
+        coeff_fit, *_ = np.linalg.lstsq(design, optic[valid], rcond=None)
+        coeff = coeff_fit
+        full_design = np.stack([np.ones_like(xx), xx, yy, xx**2, xx * yy, yy**2], axis=0)
+    else:
+        design = np.column_stack([
+            np.ones(np.count_nonzero(valid), dtype=np.float64),
+            xx[valid],
+            yy[valid],
+            xx[valid] ** 2,
+            yy[valid] ** 2,
+        ])
+        coeff_fit, *_ = np.linalg.lstsq(design, optic[valid], rcond=None)
+        coeff = np.asarray([coeff_fit[0], coeff_fit[1], coeff_fit[2], coeff_fit[3], 0.0, coeff_fit[4]], dtype=np.float64)
+        full_design = np.stack([np.ones_like(xx), xx, yy, xx**2, xx * yy, yy**2], axis=0)
     fitted = np.tensordot(coeff, full_design, axes=(0, 0))
     residual = optic - fitted
     residual[~valid] = np.nan
 
     qxx = float(coeff[3])
-    qyy = float(coeff[4])
+    qxy = float(coeff[4])
+    qyy = float(coeff[5])
+    quad = np.array([[qxx, 0.5 * qxy], [0.5 * qxy, qyy]], dtype=np.float64)
+    eigvals, eigvecs = np.linalg.eigh(quad)
+    order = np.argsort(np.abs(eigvals))[::-1]
+    eigvals = eigvals[order]
+    eigvecs = eigvecs[:, order]
+    principal_radii = np.asarray([500.0 / q if abs(q) > 1e-30 else np.nan for q in eigvals], dtype=np.float64)
+    principal_angles_deg = np.degrees(np.arctan2(eigvecs[1, :], eigvecs[0, :]))
     radius_x = float(500.0 / qxx) if abs(qxx) > 1e-30 else float("nan")
     radius_y = float(500.0 / qyy) if abs(qyy) > 1e-30 else float("nan")
     summary = {
-        "model": "height_nm = c + bx*x_mm + by*y_mm + qxx*x_mm^2 + qyy*y_mm^2",
-        "sag_convention": "height_m = x_m^2/(2*R_m), so R_m = 500/q for q in nm/mm^2",
+        "model": "height_nm = c + bx*x_mm + by*y_mm + qxx*x_mm^2 + qxy*x_mm*y_mm + qyy*y_mm^2" if include_twist else "height_nm = c + bx*x_mm + by*y_mm + qxx*x_mm^2 + qyy*y_mm^2; qxy fixed to 0",
+        "include_twist": bool(include_twist),
+        "sag_convention": "height_m = u_m^2/(2*R_m), so R_m = 500/q for q in nm/mm^2 along a principal axis",
+        "rotation_note": "The x*y twist term is included in this fit." if include_twist else "The x*y twist term is fixed to zero in this fit; twist remains in the residual.",
         "pixel_spacing_y_mm": sy_mm,
         "pixel_spacing_x_mm": sx_mm,
         "valid_pixels": int(np.count_nonzero(valid)),
-        "coeff_names": ["c_nm", "bx_nm_per_mm", "by_nm_per_mm", "qxx_nm_per_mm2", "qyy_nm_per_mm2"],
+        "coeff_names": ["c_nm", "bx_nm_per_mm", "by_nm_per_mm", "qxx_nm_per_mm2", "qxy_nm_per_mm2", "qyy_nm_per_mm2"],
         "coefficients": [float(v) for v in coeff],
+        "quadratic_matrix_nm_per_mm2": quad.tolist(),
+        "principal_q_nm_per_mm2": eigvals.tolist(),
+        "principal_radius_m": principal_radii.tolist(),
+        "principal_axis_vectors_xy": eigvecs.T.tolist(),
+        "principal_axis_angles_deg_from_x": principal_angles_deg.tolist(),
         "radius_x_m": radius_x,
         "radius_y_m": radius_y,
+        "radius_major_m": float(principal_radii[0]),
+        "radius_minor_m": float(principal_radii[1]) if principal_radii.size > 1 else float("nan"),
         "residual_rms_nm": finite_rms(residual),
         "residual_pv_nm": finite_pv(residual),
     }
@@ -1509,6 +1629,7 @@ def save_figures(result: StitchingResult, data: dict[str, Any], output_dir: Path
             "loss_optic_prior",
             "loss_plane_l2",
             "loss_curv_anchor",
+            "loss_optic_coeff",
             "loss_s_prior",
             "loss_smoothness",
             "loss_seam_smoothness",
@@ -1536,117 +1657,72 @@ def save_figures(result: StitchingResult, data: dict[str, Any], output_dir: Path
         plt.close(fig)
 
 
+def json_safe(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    return value
+
+
+def second_order_qxy(fit_summary: Any) -> float | None:
+    if not isinstance(fit_summary, dict):
+        return None
+    coeff = fit_summary.get("coefficients")
+    if isinstance(coeff, dict):
+        value = coeff.get("qxy")
+        return float(value) if value is not None else None
+    if isinstance(coeff, (list, tuple)) and len(coeff) > 4:
+        return float(coeff[4])
+    return None
+
+
+def write_run_parameters(path: Path, args: argparse.Namespace, extra: dict[str, Any] | None = None) -> None:
+    record: dict[str, Any] = {
+        "script": Path(__file__).name,
+        "script_path": str(Path(__file__).resolve()),
+        "command_line": [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
+        "working_directory": str(Path.cwd()),
+        "python_executable": sys.executable,
+        "python_version": sys.version,
+        "platform": platform.platform(),
+        "parameters": vars(args),
+        "resolved_paths": {
+            "input": str(Path(args.input).resolve()),
+            "output_dir": str(Path(args.output_dir).resolve()),
+        },
+        "environment": {
+            "PYTHONIOENCODING": os.environ.get("PYTHONIOENCODING"),
+            "MPLBACKEND": os.environ.get("MPLBACKEND"),
+            "CONDA_DEFAULT_ENV": os.environ.get("CONDA_DEFAULT_ENV"),
+            "CONDA_PREFIX": os.environ.get("CONDA_PREFIX"),
+        },
+    }
+    if extra:
+        record.update(extra)
+    path.write_text(json.dumps(json_safe(record), indent=2, ensure_ascii=False), encoding="utf-8")
+
+
 def load_npz(path: Path) -> dict[str, Any]:
     with np.load(path, allow_pickle=True) as z:
         return {k: z[k] for k in z.files}
 
 
 
-def natural_sort_key(path: Path) -> tuple[Any, ...]:
-    parts = re.split(r"(\d+)", path.name)
-    return tuple(int(part) if part.isdigit() else part.lower() for part in parts)
-
-
-def load_asc_height_map(path: Path) -> tuple[np.ndarray, dict[str, Any]]:
-    lines = path.read_text(errors="replace").splitlines()
-    blank = next(i for i, line in enumerate(lines) if line.strip() == "")
-    meta: dict[str, Any] = {}
-    for line in lines[:blank]:
-        parts = line.split("\t")
-        if len(parts) < 2:
-            continue
-        key = parts[0].strip()
-        value: Any = parts[1].strip()
-        unit = parts[2].strip() if len(parts) >= 3 else ""
-        try:
-            value = float(value)
-            if value.is_integer():
-                value = int(value)
-        except ValueError:
-            pass
-        meta[key] = value
-        if unit:
-            meta[f"{key} Unit"] = unit
-    z = np.genfromtxt(path, delimiter="\t", skip_header=blank + 1, dtype=np.float64, invalid_raise=False, autostrip=True)
-    if z.ndim == 2 and z.shape[1] > 0 and np.all(~np.isfinite(z[:, -1])):
-        z = z[:, :-1]
-    z[~np.isfinite(z)] = np.nan
-    return z, meta
-
-
-def parse_crop(crop: str | None) -> tuple[slice, slice]:
-    if not crop:
-        return slice(None), slice(None)
-    parts = [int(part) if part else None for part in crop.split(":")]
-    if len(parts) != 4:
-        raise ValueError("--raw-crop must be y0:y1:x0:x1")
-    return slice(parts[0], parts[1]), slice(parts[2], parts[3])
-
-
-def scan_positions_from_grid(n_frames: int, grid_y: int, grid_x: int, step_px: float, *, serpentine: bool) -> np.ndarray:
-    if grid_y * grid_x != n_frames:
-        raise ValueError(f"raw grid {grid_y}x{grid_x} does not match {n_frames} ASC files")
-    positions = []
-    for iy in range(grid_y):
-        for ix_file in range(grid_x):
-            ix = grid_x - 1 - ix_file if serpentine and iy % 2 else ix_file
-            positions.append([iy * step_px, ix * step_px])
-    return np.asarray(positions, dtype=np.float64)
-
-
-def load_raw_asc_stitching_data(args: argparse.Namespace) -> dict[str, Any]:
-    raw_dir = Path(args.raw_dir)
-    files = sorted(raw_dir.glob(args.raw_glob), key=natural_sort_key)
-    if args.raw_limit is not None:
-        files = files[: args.raw_limit]
-    if not files:
-        raise FileNotFoundError(f"No ASC files matched {args.raw_glob!r} in {raw_dir}")
-    crop_y, crop_x = parse_crop(args.raw_crop)
-    measurements = []
-    masks = []
-    first_meta: dict[str, Any] | None = None
-    for path in files:
-        z, meta = load_asc_height_map(path)
-        if first_meta is None:
-            first_meta = meta
-        z = z[crop_y, crop_x]
-        if args.raw_downsample > 1:
-            z = z[:: args.raw_downsample, :: args.raw_downsample]
-        if args.raw_subtract_median:
-            valid = np.isfinite(z)
-            if np.any(valid):
-                z = z - np.nanmedian(z)
-        measurements.append(z)
-        masks.append(np.isfinite(z).astype(np.float64))
-    data = np.asarray(measurements, dtype=np.float64)
-    mask_data = np.asarray(masks, dtype=np.float64)
-    meta = first_meta or {}
-    pixel_spacing_value = args.raw_pixel_spacing_mm if args.raw_pixel_spacing_mm is not None else meta.get("xPixSpace")
-    if pixel_spacing_value is None:
-        raise ValueError("Could not infer raw pixel spacing; pass --raw-pixel-spacing-mm")
-    pixel_spacing_mm = float(pixel_spacing_value)
-    step_px = args.raw_step_mm / pixel_spacing_mm / args.raw_downsample
-    positions = scan_positions_from_grid(len(files), args.raw_grid_y, args.raw_grid_x, step_px, serpentine=args.raw_serpentine)
-    optic_h = int(np.ceil(np.max(positions[:, 0]) + data.shape[1] + 8))
-    optic_w = int(np.ceil(np.max(positions[:, 1]) + data.shape[2] + 8))
-    print(f"loaded {len(files)} ASC frames from {raw_dir}; frame shape={data.shape[1:]}; step={step_px:.3f} px; grid={args.raw_grid_y}x{args.raw_grid_x}")
-    return {
-        "measurements": data,
-        "masks": mask_data,
-        "scan_positions": positions,
-        "optic_shape": np.array([optic_h, optic_w]),
-        "raw_files": np.array([str(path) for path in files]),
-        "raw_pixel_spacing_mm": np.array(pixel_spacing_mm),
-        "raw_step_mm": np.array(args.raw_step_mm),
-        "raw_downsample": np.array(args.raw_downsample),
-        "raw_grid_shape": np.array([args.raw_grid_y, args.raw_grid_x]),
-    }
 
 
 def run(args: argparse.Namespace) -> None:
-    data = load_raw_asc_stitching_data(args) if args.raw_dir else load_npz(Path(args.input))
+    data = load_npz(Path(args.input))
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    run_parameters_path = output_dir / "run_parameters.json"
+    write_run_parameters(run_parameters_path, args, {"status": "started"})
     pixel_spacing = pixel_spacing_from_data(data)
     canvas_shape = tuple(data["optic_shape"]) if "optic_shape" in data else canvas_shape_from_positions(
         data["scan_positions"], data["measurements"].shape[1:], margin=8, requested=None
@@ -1659,8 +1735,7 @@ def run(args: argparse.Namespace) -> None:
         "mode": args.mode,
         "adp_init": args.adp_init,
         "adp_curvature_anchor": args.adp_curvature_anchor,
-        "input": str(Path(args.input)) if not args.raw_dir else None,
-        "raw_dir": args.raw_dir,
+        "input": str(Path(args.input)),
         "input_local_second_order": local_second_order_statistics(data["measurements"], data["masks"], pixel_spacing),
         "aperture_feather_effective": 0,
         "aperture_feather_note": "aperture feathering is disabled because it introduced stripe artifacts in recovered optics",
@@ -1684,9 +1759,18 @@ def run(args: argparse.Namespace) -> None:
             sequential_optic,
             np.isfinite(sequential_optic).astype(np.float64),
             pixel_spacing,
+            include_twist=True,
+        )
+        sequential_second_order_fit_no_twist, sequential_second_order_residual_no_twist, sequential_second_order_summary_no_twist = fit_second_order_surface(
+            sequential_optic,
+            np.isfinite(sequential_optic).astype(np.float64),
+            pixel_spacing,
+            include_twist=False,
         )
         summary["sequential_global_tilt_removed"] = sequential_tilt_summary
         summary["sequential_second_order_fit"] = sequential_second_order_summary
+        summary["sequential_second_order_fit_with_twist"] = sequential_second_order_summary
+        summary["sequential_second_order_fit_no_twist"] = sequential_second_order_summary_no_twist
         summary["sequential_overlap_baseline"] = {
             "method": "frames placed at preprocessed scan positions; each new frame piston/x-tilt/y-tilt is least-squares fitted on the overlap with the current canvas; overlapping pixels are weighted-averaged; final global tilt is removed",
             "position_source": "data['scan_positions']",
@@ -1699,14 +1783,79 @@ def run(args: argparse.Namespace) -> None:
             "sequential_plane_coeffs": sequential_plane_coeffs,
             "sequential_second_order_fit": sequential_second_order_fit,
             "sequential_second_order_residual": sequential_second_order_residual,
+            "sequential_second_order_fit_with_twist": sequential_second_order_fit,
+            "sequential_second_order_residual_with_twist": sequential_second_order_residual,
+            "sequential_second_order_fit_no_twist": sequential_second_order_fit_no_twist,
+            "sequential_second_order_residual_no_twist": sequential_second_order_residual_no_twist,
         })
+        add_second_order_npz_outputs(
+            output_arrays,
+            "baseline",
+            sequential_optic,
+            sequential_second_order_fit,
+            sequential_second_order_residual,
+            sequential_second_order_summary,
+            pixel_spacing,
+        )
+        add_second_order_npz_outputs(
+            output_arrays,
+            "sequential",
+            sequential_optic,
+            sequential_second_order_fit,
+            sequential_second_order_residual,
+            sequential_second_order_summary,
+            pixel_spacing,
+        )
+        add_second_order_npz_outputs(
+            output_arrays,
+            "baseline_with_twist",
+            sequential_optic,
+            sequential_second_order_fit,
+            sequential_second_order_residual,
+            sequential_second_order_summary,
+            pixel_spacing,
+        )
+        add_second_order_npz_outputs(
+            output_arrays,
+            "baseline_no_twist",
+            sequential_optic,
+            sequential_second_order_fit_no_twist,
+            sequential_second_order_residual_no_twist,
+            sequential_second_order_summary_no_twist,
+            pixel_spacing,
+        )
+        add_second_order_npz_outputs(
+            output_arrays,
+            "sequential_with_twist",
+            sequential_optic,
+            sequential_second_order_fit,
+            sequential_second_order_residual,
+            sequential_second_order_summary,
+            pixel_spacing,
+        )
+        add_second_order_npz_outputs(
+            output_arrays,
+            "sequential_no_twist",
+            sequential_optic,
+            sequential_second_order_fit_no_twist,
+            sequential_second_order_residual_no_twist,
+            sequential_second_order_summary_no_twist,
+            pixel_spacing,
+        )
+        output_arrays["baseline_raw_height_before_global_tilt_removal_nm"] = sequential_optic_raw
+        output_arrays["sequential_raw_height_before_global_tilt_removal_nm"] = sequential_optic_raw
         if save_sequential:
             save_tiff(output_dir / "sequential_overlap_stitch_raw.tiff", sequential_optic_raw)
             save_tiff(output_dir / "sequential_overlap_stitch.tiff", sequential_optic)
             save_tiff(output_dir / "sequential_second_order_fit.tiff", sequential_second_order_fit)
             save_tiff(output_dir / "sequential_second_order_residual.tiff", sequential_second_order_residual)
+            save_tiff(output_dir / "sequential_second_order_fit_with_twist.tiff", sequential_second_order_fit)
+            save_tiff(output_dir / "sequential_second_order_residual_with_twist.tiff", sequential_second_order_residual)
+            save_tiff(output_dir / "sequential_second_order_fit_no_twist.tiff", sequential_second_order_fit_no_twist)
+            save_tiff(output_dir / "sequential_second_order_residual_no_twist.tiff", sequential_second_order_residual_no_twist)
             save_map_figure(output_dir / "sequential_overlap_stitch.png", sequential_optic, "sequential overlap stitching, global tilt removed", symmetric=False)
-            save_map_figure(output_dir / "sequential_second_order_residual.png", sequential_second_order_residual, "sequential baseline residual after 2nd-order fit")
+            save_map_figure(output_dir / "sequential_second_order_residual.png", sequential_second_order_residual, "sequential baseline residual after 2nd-order fit, with twist")
+            save_map_figure(output_dir / "sequential_second_order_residual_no_twist.png", sequential_second_order_residual_no_twist, "sequential baseline residual after 2nd-order fit, no twist")
 
     result: StitchingResult | None = None
     if args.mode in ("autodiff", "both"):
@@ -1719,38 +1868,35 @@ def run(args: argparse.Namespace) -> None:
             data["masks"],
             data["scan_positions"],
             optic_canvas_shape=canvas_shape,
-            S_known=data.get("systematic_true") if args.use_known_s and "systematic_true" in data else None,
-            fit_S=args.fit_s,
             fit_positions=args.fit_positions,
-            fit_power_per_frame=args.fit_power,
             plane_order=args.plane_order,
             interp_mode=args.interp_mode,
-            aperture_feather=0,
+            optic_model=args.optic_model,
+            optic_poly_order=args.optic_poly_order,
+            optic_poly_order_x=args.optic_poly_order_x,
+            optic_poly_order_y=args.optic_poly_order_y,
+            optic_poly_basis=args.optic_poly_basis,
             min_output_coverage=args.min_output_coverage,
             smoothness=args.smoothness,
             seam_smoothness=args.seam_smoothness,
             plane_l2=args.plane_l2,
-            s_l2=args.s_l2,
-            s_smoothness=args.s_smoothness,
             frame_batch_size=args.batch_size,
             device=device,
-            phase1_iters=args.phase1_iters,
             phase2_iters=args.phase2_iters,
-            phase3_iters=args.phase3_iters,
             step_px=step_px_from_data(data),
             initial_optic=initial_optic,
             anchor_curvature=args.adp_curvature_anchor == "initial",
-            s_init=args.s_init,
-            s_init_iters=args.s_init_iters,
+            s_mode=args.s_mode,
+            s_highpass_order=args.s_highpass_order,
             optic_prior_l2=args.adp_prior_l2,
             position_l2=args.position_l2,
             curv_anchor_l2=args.curv_anchor_l2,
+            optic_coeff_l2=args.optic_coeff_l2,
+            optic_coeff_degree_power=args.optic_coeff_degree_power,
             lam_g=args.lam_g,
-            lam_s=args.lam_s,
             accept_tol=args.accept_tol,
             rollback_factor=args.rollback_factor,
             lr_o=args.lr_o,
-            lr_s=args.lr_s,
             lr_planes=args.lr_planes,
             lr_pos=args.lr_pos,
         )
@@ -1769,28 +1915,132 @@ def run(args: argparse.Namespace) -> None:
             result.optic,
             result.observed_mask,
             pixel_spacing,
+            include_twist=True,
+        )
+        optic_second_order_fit_no_twist, optic_second_order_residual_no_twist, second_order_summary_no_twist = fit_second_order_surface(
+            result.optic,
+            result.observed_mask,
+            pixel_spacing,
+            include_twist=False,
         )
         save_tiff(output_dir / "optic_second_order_fit.tiff", optic_second_order_fit)
         save_tiff(output_dir / "optic_second_order_residual.tiff", optic_second_order_residual)
-        save_map_figure(output_dir / "optic_second_order_residual.png", optic_second_order_residual, "ADP/autodiff optic residual after 2nd-order fit")
+        save_tiff(output_dir / "optic_second_order_fit_with_twist.tiff", optic_second_order_fit)
+        save_tiff(output_dir / "optic_second_order_residual_with_twist.tiff", optic_second_order_residual)
+        save_tiff(output_dir / "optic_second_order_fit_no_twist.tiff", optic_second_order_fit_no_twist)
+        save_tiff(output_dir / "optic_second_order_residual_no_twist.tiff", optic_second_order_residual_no_twist)
+        save_map_figure(output_dir / "optic_second_order_residual.png", optic_second_order_residual, "ADP/autodiff optic residual after 2nd-order fit, with twist")
+        save_map_figure(output_dir / "optic_second_order_residual_no_twist.png", optic_second_order_residual_no_twist, "ADP/autodiff optic residual after 2nd-order fit, no twist")
         save_figures(result, data, output_dir)
 
+        reconstruction_error = result.residuals
+        reconstruction_error_rms_by_frame = np.asarray([finite_rms(frame) for frame in reconstruction_error], dtype=np.float64)
+        reconstruction_error_pv_by_frame = np.asarray([finite_pv(frame) for frame in reconstruction_error], dtype=np.float64)
+        recovered_systematic = result.systematic if result.systematic is not None else np.array([], dtype=np.float64)
         output_arrays.update({
+            "input_measurements_nm": data["measurements"],
             "optic": result.optic,
-            "systematic": result.systematic if result.systematic is not None else np.array([]),
+            "systematic": recovered_systematic,
+            "recovered_systematic_error_nm": recovered_systematic,
+            "recovered_systematic_profile_x_nm": profile_axis_nanmedian(recovered_systematic, axis=0) if recovered_systematic.size else np.array([], dtype=np.float64),
+            "recovered_systematic_profile_y_nm": profile_axis_nanmedian(recovered_systematic, axis=1) if recovered_systematic.size else np.array([], dtype=np.float64),
             "planes": result.planes,
             "positions": result.positions,
-            "residuals": result.residuals,
+            "residuals": reconstruction_error,
+            "reconstruction_error_nm": reconstruction_error,
+            "adp_reconstruction_error_nm": reconstruction_error,
             "reconstructed": result.reconstructed,
+            "reconstructed_measurements_nm": result.reconstructed,
+            "adp_reconstructed_measurements_nm": result.reconstructed,
+            "reconstruction_error_rms_by_frame_nm": reconstruction_error_rms_by_frame,
+            "adp_reconstruction_error_rms_by_frame_nm": reconstruction_error_rms_by_frame,
+            "reconstruction_error_pv_by_frame_nm": reconstruction_error_pv_by_frame,
+            "adp_reconstruction_error_pv_by_frame_nm": reconstruction_error_pv_by_frame,
+            "reconstruction_error_global_rms_nm": np.asarray(finite_rms(reconstruction_error), dtype=np.float64),
+            "adp_reconstruction_error_global_rms_nm": np.asarray(finite_rms(reconstruction_error), dtype=np.float64),
+            "reconstruction_error_global_pv_nm": np.asarray(finite_pv(reconstruction_error), dtype=np.float64),
+            "adp_reconstruction_error_global_pv_nm": np.asarray(finite_pv(reconstruction_error), dtype=np.float64),
             "observed_mask": result.observed_mask,
             "quality_mask": result.quality_mask,
             "loss_history": np.array(result.loss_history, dtype=object),
             "optic_second_order_fit": optic_second_order_fit,
             "optic_second_order_residual": optic_second_order_residual,
+            "optic_second_order_fit_with_twist": optic_second_order_fit,
+            "optic_second_order_residual_with_twist": optic_second_order_residual,
+            "optic_second_order_fit_no_twist": optic_second_order_fit_no_twist,
+            "optic_second_order_residual_no_twist": optic_second_order_residual_no_twist,
         })
+        add_second_order_npz_outputs(
+            output_arrays,
+            "adp",
+            result.optic,
+            optic_second_order_fit,
+            optic_second_order_residual,
+            second_order_summary,
+            pixel_spacing,
+        )
+        add_second_order_npz_outputs(
+            output_arrays,
+            "autodiff",
+            result.optic,
+            optic_second_order_fit,
+            optic_second_order_residual,
+            second_order_summary,
+            pixel_spacing,
+        )
+        add_second_order_npz_outputs(
+            output_arrays,
+            "adp_with_twist",
+            result.optic,
+            optic_second_order_fit,
+            optic_second_order_residual,
+            second_order_summary,
+            pixel_spacing,
+        )
+        add_second_order_npz_outputs(
+            output_arrays,
+            "adp_no_twist",
+            result.optic,
+            optic_second_order_fit_no_twist,
+            optic_second_order_residual_no_twist,
+            second_order_summary_no_twist,
+            pixel_spacing,
+        )
+        add_second_order_npz_outputs(
+            output_arrays,
+            "autodiff_with_twist",
+            result.optic,
+            optic_second_order_fit,
+            optic_second_order_residual,
+            second_order_summary,
+            pixel_spacing,
+        )
+        add_second_order_npz_outputs(
+            output_arrays,
+            "autodiff_no_twist",
+            result.optic,
+            optic_second_order_fit_no_twist,
+            optic_second_order_residual_no_twist,
+            second_order_summary_no_twist,
+            pixel_spacing,
+        )
+        if result.summary.get("optic_model") != "pixel" and result.summary.get("optic_poly_coefficients") is not None:
+            output_arrays["optic_poly_coefficients"] = np.asarray(result.summary["optic_poly_coefficients"], dtype=np.float64)
+            output_arrays["optic_poly_terms"] = np.asarray(result.summary.get("optic_poly_terms", []), dtype=np.int64)
         summary.update(result.summary)
+        summary["reconstruction_error"] = {
+            "model": "processed input measurement - reconstructed measurement",
+            "global_rms_nm": finite_rms(reconstruction_error),
+            "global_pv_nm": finite_pv(reconstruction_error),
+            "frame_rms_mean_nm": float(np.nanmean(reconstruction_error_rms_by_frame)),
+            "frame_rms_max_nm": float(np.nanmax(reconstruction_error_rms_by_frame)),
+        }
         summary["autodiff_second_order_fit"] = second_order_summary
+        summary["autodiff_second_order_fit_with_twist"] = second_order_summary
+        summary["autodiff_second_order_fit_no_twist"] = second_order_summary_no_twist
         summary["second_order_fit"] = second_order_summary
+        summary["second_order_fit_with_twist"] = second_order_summary
+        summary["second_order_fit_no_twist"] = second_order_summary_no_twist
 
     if args.mode == "both" and result is not None and sequential_optic is not None:
         raw_difference, raw_alignment = aligned_difference_remove_piston_tilt(result.optic, sequential_optic, pixel_spacing)
@@ -1809,79 +2059,137 @@ def run(args: argparse.Namespace) -> None:
         save_map_figure(
             output_dir / "autodiff_minus_sequential.png",
             residual_difference,
-            "ADP residual minus sequential residual after independent 2nd-order fits",
+            "ADP residual minus sequential residual after independent 2nd-order fits, with twist",
         )
         save_tiff(output_dir / "autodiff_second_order_residual_minus_sequential.tiff", residual_difference)
         save_map_figure(
             output_dir / "autodiff_second_order_residual_minus_sequential.png",
             residual_difference,
-            "ADP residual minus sequential residual after independent 2nd-order fits",
+            "ADP residual minus sequential residual after independent 2nd-order fits, with twist",
+        )
+        save_tiff(output_dir / "autodiff_minus_sequential_with_twist.tiff", residual_difference)
+        save_map_figure(
+            output_dir / "autodiff_minus_sequential_with_twist.png",
+            residual_difference,
+            "ADP residual minus sequential residual after independent 2nd-order fits, with twist",
+        )
+        save_tiff(output_dir / "autodiff_second_order_residual_minus_sequential_with_twist.tiff", residual_difference)
+
+        residual_difference_no_twist = optic_second_order_residual_no_twist - sequential_second_order_residual_no_twist
+        valid_residual_difference_no_twist = (
+            np.isfinite(optic_second_order_residual_no_twist)
+            & np.isfinite(sequential_second_order_residual_no_twist)
+        )
+        residual_difference_no_twist[~valid_residual_difference_no_twist] = np.nan
+        save_tiff(output_dir / "autodiff_minus_sequential_no_twist.tiff", residual_difference_no_twist)
+        save_map_figure(
+            output_dir / "autodiff_minus_sequential_no_twist.png",
+            residual_difference_no_twist,
+            "ADP residual minus sequential residual after independent 2nd-order fits, no twist",
+        )
+        save_tiff(
+            output_dir / "autodiff_second_order_residual_minus_sequential_no_twist.tiff",
+            residual_difference_no_twist,
+        )
+        save_map_figure(
+            output_dir / "autodiff_second_order_residual_minus_sequential_no_twist.png",
+            residual_difference_no_twist,
+            "ADP residual minus sequential residual after independent 2nd-order fits, no twist",
         )
         output_arrays["autodiff_minus_sequential"] = residual_difference
+        output_arrays["autodiff_minus_sequential_with_twist"] = residual_difference
+        output_arrays["autodiff_minus_sequential_no_twist"] = residual_difference_no_twist
         output_arrays["autodiff_second_order_residual_minus_sequential"] = residual_difference
-        summary["autodiff_vs_sequential"] = {
+        output_arrays["autodiff_second_order_residual_minus_sequential_with_twist"] = residual_difference
+        output_arrays["autodiff_second_order_residual_minus_sequential_no_twist"] = residual_difference_no_twist
+        comparison_with_twist = {
             "residual_difference_rms_nm": finite_rms(residual_difference),
             "residual_difference_pv_nm": finite_pv(residual_difference),
             "raw_aligned_difference_rms_nm": finite_rms(raw_difference),
             "raw_aligned_difference_pv_nm": finite_pv(raw_difference),
             "raw_alignment_removed": raw_alignment,
-            "interpretation": "autodiff_minus_sequential now compares the two second-order residual maps, which is the meaningful figure-error comparison. The raw piston/tilt-aligned optic difference is saved separately as autodiff_minus_sequential_raw_aligned.",
+            "twist_mode": "with_twist",
+            "interpretation": "autodiff_minus_sequential is the with-twist comparison for backward compatibility. It compares the two second-order residual maps after fitting qxy. The raw piston/tilt-aligned optic difference is saved separately as autodiff_minus_sequential_raw_aligned.",
         }
+        comparison_no_twist = {
+            "residual_difference_rms_nm": finite_rms(residual_difference_no_twist),
+            "residual_difference_pv_nm": finite_pv(residual_difference_no_twist),
+            "raw_aligned_difference_rms_nm": finite_rms(raw_difference),
+            "raw_aligned_difference_pv_nm": finite_pv(raw_difference),
+            "raw_alignment_removed": raw_alignment,
+            "twist_mode": "no_twist",
+            "interpretation": "No-twist comparison fits only c, x, y, x^2, and y^2. The qxy twist term is not subtracted, so twist remains in the residual for final analysis.",
+        }
+        summary["autodiff_vs_sequential"] = comparison_with_twist
+        summary["autodiff_vs_sequential_with_twist"] = comparison_with_twist
+        summary["autodiff_vs_sequential_no_twist"] = comparison_no_twist
 
-    np.savez_compressed(output_dir / "stitching_result.npz", **output_arrays)
-    (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    npz_path = output_dir / "stitching_result.npz"
+    summary_path = output_dir / "summary.json"
+    np.savez_compressed(npz_path, **output_arrays)
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    write_run_parameters(
+        run_parameters_path,
+        args,
+        {
+            "status": "completed",
+            "outputs": {
+                "npz": str(npz_path.resolve()),
+                "summary_json": str(summary_path.resolve()),
+                "run_parameters_json": str(run_parameters_path.resolve()),
+            },
+            "summary_subset": {
+                "final_rms": summary.get("final_rms"),
+                "systematic_rms": summary.get("systematic_rms"),
+                "sequential_radius_x_m": summary.get("sequential_second_order_fit", {}).get("radius_x_m") if isinstance(summary.get("sequential_second_order_fit"), dict) else None,
+                "sequential_principal_radius_m": summary.get("sequential_second_order_fit", {}).get("principal_radius_m") if isinstance(summary.get("sequential_second_order_fit"), dict) else None,
+                "sequential_qxy_nm_per_mm2": second_order_qxy(summary.get("sequential_second_order_fit_with_twist")),
+                "sequential_principal_radius_no_twist_m": summary.get("sequential_second_order_fit_no_twist", {}).get("principal_radius_m") if isinstance(summary.get("sequential_second_order_fit_no_twist"), dict) else None,
+                "adp_radius_x_m": summary.get("autodiff_second_order_fit", {}).get("radius_x_m") if isinstance(summary.get("autodiff_second_order_fit"), dict) else None,
+                "adp_principal_radius_m": summary.get("autodiff_second_order_fit", {}).get("principal_radius_m") if isinstance(summary.get("autodiff_second_order_fit"), dict) else None,
+                "adp_qxy_nm_per_mm2": second_order_qxy(summary.get("autodiff_second_order_fit_with_twist")),
+                "adp_principal_radius_no_twist_m": summary.get("autodiff_second_order_fit_no_twist", {}).get("principal_radius_m") if isinstance(summary.get("autodiff_second_order_fit_no_twist"), dict) else None,
+            },
+        },
+    )
     print(json.dumps(summary, indent=2))
     print(f"Wrote {output_dir.resolve()}")
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", default="stitching_simulation_data.npz")
-    parser.add_argument("--output-dir", default="stitching_outputs")
-    parser.add_argument("--mode", default="both", choices=["sequential", "autodiff", "both"], help="Calculation mode: sequential overlap stitching, ADP/autodiff global optimization, or both.")
-    parser.add_argument("--adp-init", default="sequential", choices=["sequential", "warm_average"], help="Initial optic for ADP/autodiff. sequential uses overlap stitching as warm start; warm_average uses the internal averaged warm start.")
-    parser.add_argument("--adp-curvature-anchor", default="initial", choices=["initial", "none"], help="Keep ADP global x^2/y^2 curvature tied to its initial optic. Recommended for 1-D scans.")
-    parser.add_argument("--adp-prior-l2", type=float, default=0.005, help="L2 prior that keeps ADP optic corrections close to the refreshed initial optic; use 0 to disable.")
-    parser.add_argument("--curv-anchor-l2", type=float, default=100.0, help="Soft L2 penalty tying ADP x^2/y^2 curvature to the refreshed initial optic. Replaces hard projection.")
-    parser.add_argument("--lam-g", type=float, default=1e-6, help="Weight for universal O/plane gauge diagnostics. Keep tiny for curved 1-D scans so gauge terms do not dominate data fitting.")
-    parser.add_argument("--lam-s", type=float, default=1.0, help="Weight for the residual S gauge penalty. S is gauge-projected in the forward model, so this can stay small.")
-    parser.add_argument("--accept-tol", type=float, default=1.05, help="Accept a candidate ADP state as the new best when total loss is within this factor of the best loss.")
-    parser.add_argument("--rollback-factor", type=float, default=1.5, help="Restore the best ADP state and Adam state only when total loss exceeds this factor of the best loss.")
-    parser.add_argument("--raw-dir", default=None, help="Folder of interferometer ASC files to stitch instead of --input NPZ.")
-    parser.add_argument("--raw-glob", default="*.asc", help="Glob for raw ASC frames inside --raw-dir.")
-    parser.add_argument("--raw-grid-y", type=int, default=3, help="Number of scan rows for raw ASC data.")
-    parser.add_argument("--raw-grid-x", type=int, default=23, help="Number of scan columns for raw ASC data.")
-    parser.add_argument("--raw-step-mm", type=float, default=4.0, help="Nominal scan step in millimeters for raw ASC data.")
-    parser.add_argument("--raw-pixel-spacing-mm", type=float, default=None, help="Override xPixSpace metadata in millimeters per pixel.")
-    parser.add_argument("--raw-downsample", type=int, default=4, help="Integer stride downsample for raw ASC maps before stitching.")
-    parser.add_argument("--raw-crop", default=None, help="Optional raw crop as y0:y1:x0:x1 before downsampling.")
-    parser.add_argument("--raw-limit", type=int, default=None, help="Load only the first N raw ASC files for debugging.")
-    parser.add_argument("--raw-serpentine", action="store_true", help="Interpret alternate raw scan rows as reversed in X.")
-    parser.add_argument("--raw-subtract-median", action="store_true", help="Subtract each raw frame median before stitching.")
-    parser.add_argument("--fit-s", action="store_true", help="Jointly recover interferometer systematic S.")
-    parser.add_argument("--s-init", default="mean", choices=["none", "mean"], help="Initialize fitted S from detector-coordinate mean residual after sequential warm start.")
-    parser.add_argument("--s-init-iters", type=int, default=3, help="Closed-form alternating S/plane initialization iterations before Adam.")
-    parser.add_argument("--use-known-s", action="store_true", help="Use systematic_true from simulation as fixed S.")
-    parser.add_argument("--fit-positions", action="store_true")
-    parser.add_argument("--fit-power", action="store_true")
-    parser.add_argument("--plane-order", default="tilt", choices=["piston", "tilt"], help="Per-frame low-order alignment model. Tilt helps overlap alignment; avoid --fit-power when fitting curvature.")
-    parser.add_argument("--interp-mode", default="bilinear", choices=["bilinear", "bicubic"])
-    parser.add_argument("--aperture-feather", type=int, default=0, help="Deprecated/ignored: aperture feathering is disabled because it induced stripes.")
-    parser.add_argument("--min-output-coverage", type=float, default=0.15, help="Hide optic pixels below this normalized coverage.")
-    parser.add_argument("--smoothness", type=float, default=0.0, help="Coverage-aware second-difference smoothness on the recovered optic O. Penalizes small-scale ripple without strongly penalizing curvature.")
-    parser.add_argument("--seam-smoothness", type=float, default=0.0, help="Coverage-edge second-difference penalty on O. Use this to suppress jumps/kinks at aperture/overlap boundaries without flattening mirror slope.")
-    parser.add_argument("--plane-l2", type=float, default=0.0, help="L2 penalty on per-frame tilt/power coefficients; piston is never penalized.")
-    parser.add_argument("--position-l2", type=float, default=1.0, help="L2 penalty on refined position corrections in pixel units when --fit-positions is used.")
-    parser.add_argument("--s-l2", type=float, default=1e-4, help="L2 penalty on the gauge-projected jointly fitted systematic S.")
-    parser.add_argument("--s-smoothness", type=float, default=1e-4, help="Gradient smoothness penalty on the gauge-projected jointly fitted systematic S.")
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--phase1-iters", type=int, default=0)
-    parser.add_argument("--phase2-iters", type=int, default=300)
-    parser.add_argument("--phase3-iters", type=int, default=0, help="Optional L-BFGS polish iterations after joint Adam. Keep 0 for curvature-anchored 1-D scans.")
-    parser.add_argument("--lr-o", type=float, default=2e-2)
-    parser.add_argument("--lr-s", type=float, default=5e-3)
-    parser.add_argument("--lr-planes", type=float, default=1e-2)
-    parser.add_argument("--lr-pos", type=float, default=1e-3)
-    parser.add_argument("--device", default="cpu")
+    parser = argparse.ArgumentParser(description="Stitch preprocessed interferometer data with sequential and polynomial ADP modes.")
+    parser.add_argument("--input", default="processed_stitching_input.npz", help="Preprocessed NPZ from preprocess_interferometer_data.py.")
+    parser.add_argument("--output-dir", default="stitching_outputs", help="Output directory for TIFF/PNG/NPZ/JSON results.")
+    parser.add_argument("--mode", default="both", choices=["sequential", "autodiff", "both"], help="Calculation mode: sequential baseline, polynomial ADP, or both.")
+    parser.add_argument("--adp-init", default="sequential", choices=["sequential", "warm_average"], help="Initial optic for ADP. Use sequential for 1-D curved mirrors.")
+    parser.add_argument("--optic-model", default="poly", choices=["poly", "pixel"], help="Optic representation. poly is recommended; pixel is diagnostic only.")
+    parser.add_argument("--optic-poly-order", type=int, default=10, help="Total 2D Legendre order when anisotropic orders are not supplied.")
+    parser.add_argument("--optic-poly-order-x", type=int, default=None, help="Optional Legendre order along output X/scan direction.")
+    parser.add_argument("--optic-poly-order-y", type=int, default=None, help="Optional Legendre order along output Y/cross-scan direction.")
+    parser.add_argument("--optic-poly-basis", default="legendre", choices=["legendre"], help="Polynomial basis family; only Legendre is implemented.")
+    parser.add_argument("--adp-curvature-anchor", default="initial", choices=["initial", "none"], help="Pixel-mode curvature anchor; inactive for polynomial mode.")
+    parser.add_argument("--adp-prior-l2", type=float, default=0.005, help="Pixel/residual-image prior toward the initial optic; mainly diagnostic for pixel mode.")
+    parser.add_argument("--curv-anchor-l2", type=float, default=100.0, help="Pixel-mode soft curvature-anchor weight; inactive for polynomial mode.")
+    parser.add_argument("--optic-coeff-l2", type=float, default=0.0, help="Degree-weighted L2 regularization for polynomial optic coefficients.")
+    parser.add_argument("--optic-coeff-degree-power", type=float, default=4.0, help="Polynomial coefficient regularization degree exponent.")
+    parser.add_argument("--lam-g", type=float, default=1e-6, help="Universal gauge penalty for optic piston and plane means.")
+    parser.add_argument("--accept-tol", type=float, default=1.05, help="Accept candidate state when total loss is within this factor of best loss.")
+    parser.add_argument("--rollback-factor", type=float, default=1.5, help="Rollback to best state when total loss exceeds this factor of best loss.")
+    parser.add_argument("--s-mode", default="fixed_from_residual", choices=["fixed_from_residual", "none"], help="Use frozen high-pass detector residual systematic, or disable blind systematic handling.")
+    parser.add_argument("--s-highpass-order", type=int, default=3, help="Detector Legendre order removed from residual-estimated systematic.")
+    parser.add_argument("--fit-positions", action="store_true", help="Refine small residual scan-position corrections during ADP.")
+    parser.add_argument("--plane-order", default="tilt", choices=["piston", "tilt"], help="Per-frame nuisance model: piston only, or piston plus x/y tilt.")
+    parser.add_argument("--interp-mode", default="bilinear", choices=["bilinear", "bicubic"], help="Interpolation used to sample the global optic into each aperture.")
+    parser.add_argument("--min-output-coverage", type=float, default=0.15, help="Hide output optic pixels below this normalized coverage.")
+    parser.add_argument("--smoothness", type=float, default=0.0, help="Second-difference smoothness on optic image; mainly for pixel diagnostic mode.")
+    parser.add_argument("--seam-smoothness", type=float, default=0.0, help="Coverage-edge smoothness on optic image; mainly for pixel diagnostic mode.")
+    parser.add_argument("--plane-l2", type=float, default=0.0, help="L2 penalty on per-frame tilt coefficients; piston is not penalized.")
+    parser.add_argument("--position-l2", type=float, default=1.0, help="L2 penalty on refined position corrections in pixels.")
+    parser.add_argument("--batch-size", type=int, default=16, help="Number of frames per loss batch.")
+    parser.add_argument("--phase2-iters", type=int, default=300, help="Main Adam iterations for ADP refinement.")
+    parser.add_argument("--lr-o", type=float, default=2e-2, help="Adam learning rate for optic parameters.")
+    parser.add_argument("--lr-planes", type=float, default=1e-2, help="Adam learning rate for frame piston/tilt parameters.")
+    parser.add_argument("--lr-pos", type=float, default=1e-3, help="Adam learning rate for position corrections.")
+    parser.add_argument("--device", default="cpu", help="PyTorch device: cpu, cuda, or auto.")
     return parser.parse_args()
 
 
