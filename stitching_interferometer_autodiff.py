@@ -251,6 +251,9 @@ class StitchingModel(nn.Module):
         interp_mode: str = "bilinear",
         aperture_feather: int = 4,
         min_output_coverage: float = 0.15,
+        pixel_spacing: tuple[float, float] | None = None,
+        known_radius_m: float | None = None,
+        known_radius_axis: str = "x",
         step_px: float | None = None,
         initial_optic: np.ndarray | None = None,
         anchor_curvature: bool = True,
@@ -411,6 +414,7 @@ class StitchingModel(nn.Module):
             self.position_gauge_design = None
         self.curvature_anchor_enabled = bool(optic_model == "pixel" and anchor_curvature and initial_optic is not None)
         self._setup_curvature_anchor()
+        self._setup_known_radius_constraint(pixel_spacing, known_radius_m, known_radius_axis)
         if initial_optic is not None:
             self.initialize_planes_from_current_optic()
 
@@ -467,6 +471,71 @@ class StitchingModel(nn.Module):
         if values.numel() < 5:
             return torch.zeros(5, dtype=torch.float64, device=image.device)
         return torch.linalg.lstsq(self.optic_poly_design, values).solution[:, 0]
+
+    def _setup_known_radius_constraint(
+        self,
+        pixel_spacing: tuple[float, float] | None,
+        known_radius_m: float | None,
+        known_radius_axis: str,
+    ) -> None:
+        self.known_radius_enabled = False
+        self.known_radius_m = None
+        self.known_radius_axis = known_radius_axis
+        self.known_radius_valid = None
+        self.known_radius_pinv = None
+        self.known_radius_target_q = None
+        if known_radius_m is None:
+            return
+        if known_radius_axis not in ("x", "y", "principal"):
+            raise ValueError("known_radius_axis must be x, y, or principal")
+        radius_m = float(known_radius_m)
+        if not np.isfinite(radius_m) or abs(radius_m) < 1e-30:
+            raise ValueError("known_radius_m must be finite and nonzero")
+        sy_mm, sx_mm = pixel_spacing if pixel_spacing is not None else (1.0, 1.0)
+        if not np.isfinite(sy_mm) or not np.isfinite(sx_mm) or sy_mm <= 0 or sx_mm <= 0:
+            raise ValueError("known-radius constraint requires positive finite pixel spacing in mm")
+        device = self.M.device
+        y = (torch.arange(self.H, dtype=torch.float64, device=device) - (self.H - 1) / 2.0) * float(sy_mm)
+        x = (torch.arange(self.W, dtype=torch.float64, device=device) - (self.W - 1) / 2.0) * float(sx_mm)
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+        valid = self.optic_observed_mask > 0
+        if int(valid.sum().item()) < 6:
+            return
+        design = torch.stack([
+            torch.ones_like(xx)[valid],
+            xx[valid],
+            yy[valid],
+            (xx**2)[valid],
+            (xx * yy)[valid],
+            (yy**2)[valid],
+        ], dim=1)
+        self.known_radius_valid = valid
+        self.known_radius_pinv = torch.linalg.pinv(design)
+        self.known_radius_target_q = torch.as_tensor(500.0 / radius_m, dtype=torch.float64, device=device)
+        self.known_radius_enabled = True
+        self.known_radius_m = radius_m
+        self.known_radius_axis = known_radius_axis
+
+    def known_radius_coeff(self, image: torch.Tensor) -> torch.Tensor:
+        if not self.known_radius_enabled or self.known_radius_valid is None or self.known_radius_pinv is None:
+            return torch.zeros(6, dtype=torch.float64, device=image.device)
+        values = image[self.known_radius_valid]
+        return self.known_radius_pinv @ values
+
+    def known_radius_current_q(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        coeff = self.known_radius_coeff(image)
+        if self.known_radius_axis == "x":
+            return coeff[3], coeff
+        if self.known_radius_axis == "y":
+            return coeff[5], coeff
+        quad = torch.stack([
+            torch.stack([coeff[3], 0.5 * coeff[4]]),
+            torch.stack([0.5 * coeff[4], coeff[5]]),
+        ])
+        eigvals = torch.linalg.eigvalsh(quad)
+        if self.known_radius_m is not None and self.known_radius_m < 0.0:
+            return eigvals[0], coeff
+        return eigvals[-1], coeff
 
     def project_curvature_to_prior(self) -> None:
         if not self.curvature_anchor_enabled or self.O is None:
@@ -669,6 +738,7 @@ def batched_loss(
     optic_prior_l2: float,
     position_l2: float,
     curv_anchor_l2: float,
+    known_radius_l2: float,
     optic_coeff_l2: float,
     optic_coeff_degree_power: float,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
@@ -765,6 +835,13 @@ def batched_loss(
         dq = coeff[3:5] - model.curvature_prior_coeff[3:5]
         loss_curv_anchor = curv_anchor_l2 * (dq**2).sum()
 
+    loss_known_radius = torch.zeros((), dtype=torch.float64, device=device)
+    raw_known_radius = torch.zeros((), dtype=torch.float64, device=device)
+    if known_radius_l2 > 0 and model.known_radius_enabled and model.known_radius_target_q is not None:
+        current_q, _ = model.known_radius_current_q(optic_map)
+        raw_known_radius = (current_q - model.known_radius_target_q) ** 2
+        loss_known_radius = known_radius_l2 * raw_known_radius
+
     loss_optic_coeff = torch.zeros((), dtype=torch.float64, device=device)
     if model.optic_model != "pixel" and optic_coeff_l2 > 0 and model.O_coeff is not None and model.O_terms is not None:
         degrees = torch.as_tensor([ix + iy for ix, iy in model.O_terms], dtype=torch.float64, device=device)
@@ -784,6 +861,7 @@ def batched_loss(
         + loss_seam_smooth
         + loss_s_prior
         + loss_curv_anchor
+        + loss_known_radius
         + loss_optic_coeff
     )
     components = {
@@ -798,11 +876,13 @@ def batched_loss(
         "seam_smoothness": loss_seam_smooth.detach(),
         "s_prior": loss_s_prior.detach(),
         "curv_anchor": loss_curv_anchor.detach(),
+        "known_radius": loss_known_radius.detach(),
         "optic_coeff": loss_optic_coeff.detach(),
         "raw_univ_gauge": loss_univ_gauge.detach(),
         "raw_S_gauge": loss_S_gauge.detach(),
         "raw_smoothness": raw_smooth.detach(),
         "raw_seam_smoothness": raw_seam_smooth.detach(),
+        "raw_known_radius": raw_known_radius.detach(),
     }
     return total, loss_data, components
 
@@ -827,6 +907,10 @@ def reconstruct_stitching(
     frame_batch_size: int = 16,
     device: str = "cpu",
     phase2_iters: int = 500,
+    pixel_spacing: tuple[float, float] | None = None,
+    known_radius_m: float | None = None,
+    known_radius_axis: str = "x",
+    known_radius_l2: float = 100.0,
     step_px: float | None = None,
     initial_optic: np.ndarray | None = None,
     anchor_curvature: bool = True,
@@ -874,6 +958,9 @@ def reconstruct_stitching(
         optic_poly_basis=optic_poly_basis,
         aperture_feather=0,
         min_output_coverage=min_output_coverage,
+        pixel_spacing=pixel_spacing,
+        known_radius_m=known_radius_m,
+        known_radius_axis=known_radius_axis,
         step_px=step_px,
         initial_optic=initial_optic,
         anchor_curvature=anchor_curvature,
@@ -926,6 +1013,7 @@ def reconstruct_stitching(
             optic_prior_l2=0.0,
             position_l2=0.0,
             curv_anchor_l2=0.0,
+            known_radius_l2=0.0,
             optic_coeff_l2=0.0,
             optic_coeff_degree_power=optic_coeff_degree_power,
         )
@@ -945,6 +1033,7 @@ def reconstruct_stitching(
             optic_prior_l2=optic_prior_l2,
             position_l2=position_l2,
             curv_anchor_l2=curv_anchor_l2 if model.curvature_anchor_enabled else 0.0,
+            known_radius_l2=known_radius_l2 if model.known_radius_enabled else 0.0,
             optic_coeff_l2=optic_coeff_l2,
             optic_coeff_degree_power=optic_coeff_degree_power,
         )
@@ -1002,6 +1091,7 @@ def reconstruct_stitching(
         optic_prior_l2=0.0,
         position_l2=0.0,
         curv_anchor_l2=0.0,
+        known_radius_l2=0.0,
         optic_coeff_l2=0.0,
         optic_coeff_degree_power=optic_coeff_degree_power,
     )
@@ -1053,6 +1143,22 @@ def reconstruct_stitching(
     model.project_position_gauge()
     final_optic_map = model.current_optic_map()
     final_curvature_coeff = model._optic_poly_coeff(final_optic_map).detach()
+    known_radius_summary = None
+    if model.known_radius_enabled and model.known_radius_target_q is not None:
+        current_q, current_coeff = model.known_radius_current_q(final_optic_map)
+        current_q_value = float(current_q.detach().cpu().item())
+        target_q_value = float(model.known_radius_target_q.detach().cpu().item())
+        known_radius_summary = {
+            "enabled": True,
+            "axis": model.known_radius_axis,
+            "target_radius_m": model.known_radius_m,
+            "target_q_nm_per_mm2": target_q_value,
+            "current_q_nm_per_mm2": current_q_value,
+            "current_radius_m": float(500.0 / current_q_value) if abs(current_q_value) > 1e-30 else float("nan"),
+            "q_error_nm_per_mm2": current_q_value - target_q_value,
+            "known_radius_l2": known_radius_l2,
+            "fit_coefficients_c_bx_by_qxx_qxy_qyy": current_coeff.detach().cpu().numpy().tolist(),
+        }
     residuals, reconstructed = evaluate_model(model, frame_batch_size)
     optic = final_optic_map.detach().cpu().numpy().astype(np.float64)
     observed = model.optic_observed_mask.detach().cpu().numpy().astype(np.float64)
@@ -1097,6 +1203,7 @@ def reconstruct_stitching(
         "optic_prior_l2": optic_prior_l2,
         "position_l2": position_l2,
         "curv_anchor_l2": curv_anchor_l2,
+        "known_radius_constraint": known_radius_summary if known_radius_summary is not None else {"enabled": False},
         "optic_coeff_l2": optic_coeff_l2,
         "optic_coeff_degree_power": optic_coeff_degree_power,
         "lam_g": lam_g,
@@ -1629,6 +1736,7 @@ def save_figures(result: StitchingResult, data: dict[str, Any], output_dir: Path
             "loss_optic_prior",
             "loss_plane_l2",
             "loss_curv_anchor",
+            "loss_known_radius",
             "loss_optic_coeff",
             "loss_s_prior",
             "loss_smoothness",
@@ -1883,6 +1991,10 @@ def run(args: argparse.Namespace) -> None:
             frame_batch_size=args.batch_size,
             device=device,
             phase2_iters=args.phase2_iters,
+            pixel_spacing=pixel_spacing,
+            known_radius_m=args.known_radius_m,
+            known_radius_axis=args.known_radius_axis,
+            known_radius_l2=args.known_radius_l2,
             step_px=step_px_from_data(data),
             initial_optic=initial_optic,
             anchor_curvature=args.adp_curvature_anchor == "initial",
@@ -2149,6 +2261,7 @@ def run(args: argparse.Namespace) -> None:
                 "adp_principal_radius_m": summary.get("autodiff_second_order_fit", {}).get("principal_radius_m") if isinstance(summary.get("autodiff_second_order_fit"), dict) else None,
                 "adp_qxy_nm_per_mm2": second_order_qxy(summary.get("autodiff_second_order_fit_with_twist")),
                 "adp_principal_radius_no_twist_m": summary.get("autodiff_second_order_fit_no_twist", {}).get("principal_radius_m") if isinstance(summary.get("autodiff_second_order_fit_no_twist"), dict) else None,
+                "known_radius_constraint": summary.get("known_radius_constraint"),
             },
         },
     )
@@ -2169,6 +2282,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adp-curvature-anchor", default="initial", choices=["initial", "none"], help="Pixel-mode curvature anchor; inactive for polynomial mode.")
     parser.add_argument("--adp-prior-l2", type=float, default=0.005, help="Pixel/residual-image prior toward the initial optic; mainly diagnostic for pixel mode.")
     parser.add_argument("--curv-anchor-l2", type=float, default=100.0, help="Pixel-mode soft curvature-anchor weight; inactive for polynomial mode.")
+    parser.add_argument("--known-radius-m", type=float, default=None, help="Optional known mirror radius in meters. Adds a soft ADP constraint on q=500/R in nm/mm^2; default disables the constraint.")
+    parser.add_argument("--known-radius-axis", default="x", choices=["x", "y", "principal"], help="Axis used by --known-radius-m: stitched x curvature, stitched y curvature, or signed principal curvature.")
+    parser.add_argument("--known-radius-l2", type=float, default=100.0, help="Weight for the known-radius soft constraint. Active only when --known-radius-m is supplied.")
     parser.add_argument("--optic-coeff-l2", type=float, default=0.0, help="Degree-weighted L2 regularization for polynomial optic coefficients.")
     parser.add_argument("--optic-coeff-degree-power", type=float, default=4.0, help="Polynomial coefficient regularization degree exponent.")
     parser.add_argument("--lam-g", type=float, default=1e-6, help="Universal gauge penalty for optic piston and plane means.")
